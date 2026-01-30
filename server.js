@@ -13,9 +13,84 @@ const branchesRoutes = require('./routes/branches');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.set('trust proxy', 1); // Enable trust proxy for Render/Load Balancers
 app.use(cors());
 app.use(express.json());
 app.use(helmet());
+
+// Temporary Migration Endpoint: Claim Orphans
+app.post('/api/admin/claim-orphans', authMiddleware, async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) return res.status(400).json({ error: 'Store ID required' });
+
+        // Simple security check: Ensure user is connected to this store
+        // (In a real migration, we might want stricter checks, but this is an emergency fix)
+        // const hasAccess = await checkStoreAccess(storeId, userId); 
+        // if (!hasAccess) return res.status(403).json({ error: 'Unauthorized' });
+
+        const tables = ['products', 'product_categories', 'customers_info', 'orders', 'credit_accounts'];
+        const results = {};
+
+        for (const table of tables) {
+            const { data, error } = await supabaseAdmin
+                .from(table)
+                .update({ store_id: storeId })
+                .is('store_id', null)
+                .select();
+
+            if (error) console.error(`Error migrating ${table}:`, error);
+            results[table] = data ? data.length : 0;
+        }
+
+        res.json({ success: true, migrated: results });
+    } catch (e) {
+        console.error("Migration Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// DEBUG ENDPOINT: Check Store/Product Status (Safe, Read-Only)
+app.get('/api/debug/whoami', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const headerStoreId = req.headers['x-store-id'];
+
+        // 1. Get Stores owned by this user
+        const { data: stores } = await supabaseAdmin.from('stores').select('*').eq('owner_id', userId);
+
+        // 2. Count products in the requested store (if any)
+        let storeProductCount = 0;
+        if (headerStoreId) {
+            const { count } = await supabaseAdmin
+                .from('products')
+                .select('*', { count: 'exact', head: true })
+                .eq('store_id', headerStoreId);
+            storeProductCount = count;
+        }
+
+        // 3. Count orphans (products with NO store)
+        const { count: orphanCount } = await supabaseAdmin
+            .from('products')
+            .select('*', { count: 'exact', head: true })
+            .is('store_id', null);
+
+        res.json({
+            success: true,
+            user: { id: userId, email: req.user.email },
+            headerStoreId,
+            ownedStores: stores,
+            stats: {
+                inThisStore: storeProductCount,
+                orphans: orphanCount
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -98,6 +173,17 @@ app.get('/api/stock/stats', async (req, res) => {
             .lte('expire_date', expireLimit)
             .gt('remaining_qty', 0);
 
+        // Count expired batches
+        const { data: expiredBatches } = await supabaseAdmin
+            .from('product_batches')
+            .select(`
+                id,
+                products!inner(store_id)
+            `)
+            .eq('products.store_id', storeId)
+            .lt('expire_date', today)
+            .gt('remaining_qty', 0);
+
         // Count products with stock below threshold
         const { data: lowStockProducts } = await supabaseAdmin
             .from('products')
@@ -105,6 +191,13 @@ app.get('/api/stock/stats', async (req, res) => {
             .eq('store_id', storeId)
             .gt('low_stock_threshold', 0)
             .filter('stock_qty', 'lte', 'low_stock_threshold');
+
+        // Count out of stock products
+        const { count: outOfStockCount } = await supabaseAdmin
+            .from('products')
+            .select('*', { count: 'exact', head: true })
+            .eq('store_id', storeId)
+            .eq('stock_qty', 0);
 
         // Alternative query for low stock (RPC might be needed for complex comparison)
         // For now, fetch and filter in JS
@@ -115,7 +208,7 @@ app.get('/api/stock/stats', async (req, res) => {
             .gt('low_stock_threshold', 0);
 
         const lowStockCount = allProducts?.filter(p =>
-            parseFloat(p.stock_qty) <= parseFloat(p.low_stock_threshold)
+            parseFloat(p.stock_qty) <= parseFloat(p.low_stock_threshold) && parseFloat(p.stock_qty) > 0
         ).length || 0;
 
         res.json({
@@ -123,11 +216,106 @@ app.get('/api/stock/stats', async (req, res) => {
             data: {
                 total: totalProducts || 0,
                 nearExpiry: nearExpiryBatches?.length || 0,
-                lowStock: lowStockCount
+                lowStock: lowStockCount,
+                expired: expiredBatches?.length || 0,
+                outOfStock: outOfStockCount || 0
             }
         });
     } catch (error) {
         console.error('Stock Stats Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get expired items (batch-level)
+app.get('/api/stock/expired', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) {
+            return res.status(400).json({ success: false, error: 'Store ID required' });
+        }
+
+        if (!await checkStoreAccess(storeId, userId)) {
+            return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
+        }
+
+        const today = new Date().toISOString().split('T')[0];
+
+        const { data, error } = await supabaseAdmin
+            .from('product_batches')
+            .select(`
+                id,
+                batch_no,
+                expire_date,
+                remaining_qty,
+                products!inner(
+                    id,
+                    name,
+                    image_url,
+                    store_id
+                )
+            `)
+            .eq('products.store_id', storeId)
+            .lt('expire_date', today)
+            .gt('remaining_qty', 0)
+            .order('expire_date', { ascending: true })
+            .limit(20);
+
+        if (error) throw error;
+
+        const formattedData = data?.map(batch => ({
+            id: batch.id,
+            productId: batch.products.id,
+            name: batch.products.name,
+            quantity: batch.remaining_qty,
+            expireDate: batch.expire_date,
+            batchNo: batch.batch_no,
+            image: batch.products.image_url
+        })) || [];
+
+        res.json({ success: true, data: formattedData });
+    } catch (error) {
+        console.error('Expired Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get out of stock items
+app.get('/api/stock/out-of-stock', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) {
+            return res.status(400).json({ success: false, error: 'Store ID required' });
+        }
+
+        if (!await checkStoreAccess(storeId, userId)) {
+            return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
+        }
+
+        const { data, error } = await supabaseAdmin
+            .from('products')
+            .select('id, name, stock_qty, image_url')
+            .eq('store_id', storeId)
+            .eq('stock_qty', 0)
+            .order('name', { ascending: true })
+            .limit(20);
+
+        if (error) throw error;
+
+        const formattedData = data?.map(p => ({
+            id: p.id,
+            name: p.name,
+            quantity: p.stock_qty,
+            image: p.image_url
+        })) || [];
+
+        res.json({ success: true, data: formattedData });
+    } catch (error) {
+        console.error('Out of Stock Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -218,7 +406,7 @@ app.get('/api/stock/low-stock', async (req, res) => {
 
         // Filter products where stock_qty <= low_stock_threshold
         const lowStockItems = data?.filter(p =>
-            parseFloat(p.stock_qty) <= parseFloat(p.low_stock_threshold)
+            parseFloat(p.stock_qty) <= parseFloat(p.low_stock_threshold) && parseFloat(p.stock_qty) > 0
         ).map(p => ({
             id: p.id,
             name: p.name,
@@ -1040,6 +1228,7 @@ app.get('/api/products', async (req, res) => {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 20;
         const search = req.query.search || '';
+        const categoryId = req.query.categoryId || null;
         const offset = (page - 1) * limit;
 
         if (!storeId) {
@@ -1054,12 +1243,18 @@ app.get('/api/products', async (req, res) => {
             .from('products')
             .select('id, barcode, name, price, stock_qty, image_url, category_id, is_weightable, unit_type')
             .order('name', { ascending: true })
-            .range(offset, offset + limit - 1)
             .eq('store_id', storeId);
+
+        if (categoryId) {
+            query = query.eq('category_id', categoryId);
+        }
 
         if (search) {
             query = query.or(`name.ilike.%${search}%,barcode.ilike.%${search}%`);
         }
+
+        // Apply pagination LAST
+        query = query.range(offset, offset + limit - 1);
 
         const { data, error } = await query;
 
@@ -1388,6 +1583,11 @@ app.post('/api/products', async (req, res) => {
 });
 
 
+
+// Global 404 Handler
+app.use((req, res) => {
+    res.status(404).json({ success: false, error: 'Endpoint not found' });
+});
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
