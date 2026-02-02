@@ -2281,10 +2281,7 @@ app.post('/api/products', async (req, res) => {
 
 
 
-// Global 404 Handler
-app.use((req, res) => {
-    res.status(404).json({ success: false, error: 'Endpoint not found' });
-});
+
 
 // ==================== REPORTS ENDPOINTS ====================
 
@@ -2710,6 +2707,11 @@ app.delete('/api/transactions/:id', async (req, res) => {
         console.error('Delete Transaction Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
+});
+
+// Global 404 Handler (Must be last)
+app.use((req, res) => {
+    res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
 app.listen(PORT, () => {
