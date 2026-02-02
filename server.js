@@ -128,11 +128,181 @@ async function checkStoreAccess(storeId, userId) {
     return false;
 }
 
+async function signUrlIfNeeded(urlOrPath, bucket) {
+    if (!urlOrPath) return null;
+    if (bucket !== 'customers') return urlOrPath; // Only sign customers for now as it is private
+
+    let path = urlOrPath;
+    // Extract path if it's a full URL
+    if (urlOrPath.includes(`/object/public/${bucket}/`)) {
+        path = urlOrPath.split(`/object/public/${bucket}/`)[1];
+    }
+
+    const { data, error } = await supabaseAdmin
+        .storage
+        .from(bucket)
+        .createSignedUrl(path, 3600); // 1 hour expiry
+
+    if (error) {
+        console.error(`Error signing URL for ${path}:`, error);
+        return urlOrPath; // Fallback to original
+    }
+
+    return data.signedUrl;
+}
+
+function convertDateFormat(ddmmyy) {
+    const [day, month, year] = ddmmyy.split('/');
+    return `${year}-${month}-${day}`;
+}
+const { encrypt, decrypt } = require('./utils/crypto');
+const promptpay = require('promptpay-qr');
+
 function convertDateFormat(ddmmyy) {
     const [day, month, year] = ddmmyy.split('/');
     return `${year}-${month}-${day}`;
 }
 app.use('/api', authMiddleware);
+app.use('/api', rateLimiter); // Apply rate limiting to all API routes
+
+// ==================== STORE SETTINGS ENDPOINTS ====================
+
+// Get Store Settings (PromptPay)
+app.get('/api/stores/settings', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id; // Now safe
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+
+        // Check Access & Role
+        let role = 'member';
+        const { data: store } = await supabaseAdmin.from('stores').select('*').eq('id', storeId).single();
+        if (store && store.owner_id === userId) {
+            role = 'owner';
+        } else {
+            const { data: member } = await supabaseAdmin.from('store_members').select('role').eq('store_id', storeId).eq('user_id', userId).single();
+            if (member) role = member.role;
+            else return res.status(403).json({ success: false, error: 'Unauthorized' });
+        }
+
+        // Decrypt PromptPay ID
+        let realPromptPayId = decrypt(store.promptpay_id_enc);
+        let displayPromptPayId = '';
+
+        if (realPromptPayId) {
+            if (role === 'owner') {
+                displayPromptPayId = realPromptPayId; // Owner sees full number
+            } else {
+                // Manager sees masked number
+                if (store.promptpay_type === 'phone' && realPromptPayId.length >= 10) {
+                    displayPromptPayId = `${realPromptPayId.substring(0, 3)}-xxx-${realPromptPayId.substring(6)}`;
+                } else if (store.promptpay_type === 'id_card' && realPromptPayId.length >= 13) {
+                    displayPromptPayId = `x-xxxx-xxxxx-${realPromptPayId.substring(10)}`;
+                } else {
+                    displayPromptPayId = 'xxx-xxx-xxxx';
+                }
+            }
+        }
+
+        res.json({
+            success: true,
+            data: {
+                promptpay_id: displayPromptPayId, // Send masked or full based on role
+                promptpay_type: store.promptpay_type,
+                promptpay_name: store.promptpay_name,
+                role: role // Send role so frontend knows if editable
+            }
+        });
+
+    } catch (error) {
+        console.error('Get Store Settings Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Update Store Settings (PromptPay) - OWNER ONLY
+app.put('/api/stores/settings', async (req, res) => {
+    try {
+        const { promptpay_id, promptpay_type, promptpay_name } = req.body;
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+
+        // 1. Strict Owner Check
+        const { data: store } = await supabaseAdmin.from('stores').select('owner_id').eq('id', storeId).single();
+
+        if (!store || store.owner_id !== userId) {
+            return res.status(403).json({ success: false, error: 'Only Store Owner can edit payment settings' });
+        }
+
+        // 2. Encrypt Data
+        const encryptedId = encrypt(promptpay_id);
+
+        // 3. Update DB
+        const { error } = await supabaseAdmin
+            .from('stores')
+            .update({
+                promptpay_id_enc: encryptedId,
+                promptpay_type,
+                promptpay_name
+            })
+            .eq('id', storeId);
+
+        if (error) throw error;
+
+        res.json({ success: true, message: 'Settings updated successfully' });
+
+    } catch (error) {
+        console.error('Update Store Settings Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Generate PromptPay Payload (For QR Generation)
+app.post('/api/sales/qr-payload', async (req, res) => {
+    try {
+        const { amount } = req.body;
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+
+        // Check Access (Manager can access this to receive money)
+        if (!await checkStoreAccess(storeId, userId)) {
+            return res.status(403).json({ success: false, error: 'Unauthorized' });
+        }
+
+        // Get Store PromptPay Info
+        const { data: store } = await supabaseAdmin
+            .from('stores')
+            .select('promptpay_id_enc, promptpay_type')
+            .eq('id', storeId)
+            .single();
+
+        if (!store || !store.promptpay_id_enc) {
+            return res.status(400).json({ success: false, error: 'Store has not set up PromptPay yet' });
+        }
+
+        // Decrypt
+        const realPromptPayId = decrypt(store.promptpay_id_enc);
+        if (!realPromptPayId) {
+            return res.status(500).json({ success: false, error: 'Decryption failed' });
+        }
+
+        // Generate Payload using 'promptpay-qr'
+        const payload = promptpay(realPromptPayId, { amount: parseFloat(amount) });
+
+        res.json({ success: true, payload });
+
+    } catch (error) {
+        console.error('Generate QR Payload Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==================== END STORE SETTINGS ====================
 app.use('/api', rateLimiter); // Apply rate limiting to all API routes
 // ==================== STOCK ENDPOINTS ====================
 
@@ -590,17 +760,24 @@ app.post('/api/stock/check-notifications', async (req, res) => {
 
         // 6. Insert notifications for EACH user (same as payment notifications)
         let created = 0;
+        const startOfDay = new Date();
+        startOfDay.setHours(0, 0, 0, 0);
+
         for (const notif of notifications) {
+            const refId = notif.payload.batch_id || notif.payload.product_id;
+
             for (const userId of allUserIds) {
-                // Check existing for this user/product/day to avoid spam
+                // Deduplication Logic:
+                // 1. Check if there's an UNREAD notification for this specific item
+                // 2. OR check if any notification (even read) was created TODAY
                 const { data: existing } = await supabaseAdmin
                     .from('notifications')
-                    .select('id')
+                    .select('id, is_read')
                     .eq('user_id', userId)
                     .eq('store_id', storeId)
                     .eq('type', notif.type)
-                    .ilike('message', `%${notif.productName}%`)
-                    .eq('is_read', false)
+                    .contains('payload', { [notif.payload.batch_id ? 'batch_id' : 'product_id']: refId })
+                    .or(`is_read.eq.false,created_at.gte.${startOfDay.toISOString()}`)
                     .limit(1);
 
                 if (!existing || existing.length === 0) {
@@ -670,7 +847,14 @@ app.get('/api/customers/search', async (req, res) => {
 
         const { data, error } = await query;
         if (error) throw error;
-        res.json({ success: true, data: data || [] });
+
+        // Sign images
+        const signedData = await Promise.all((data || []).map(async (c) => ({
+            ...c,
+            image_url: await signUrlIfNeeded(c.image_url, 'customers')
+        })));
+
+        res.json({ success: true, data: signedData });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -706,7 +890,7 @@ app.get('/api/customers/with-debt', async (req, res) => {
                     id: customerId,
                     name: account.customers_info?.name,
                     phone: account.customers_info?.phone,
-                    image_url: account.customers_info?.image_url,
+                    image_url: await signUrlIfNeeded(account.customers_info?.image_url, 'customers'),
                     total_debt: 0,
                     accounts: []
                 };
@@ -802,6 +986,18 @@ app.post('/api/credit-payments', creditPaymentValidators, async (req, res) => {
 
             if (paymentError) throw paymentError;
             payments.push(payment);
+
+            // AUTO-SYNC: Record Income in General Ledger
+            await supabaseAdmin.from('account_transactions').insert([{
+                store_id: storeId,
+                trans_date: new Date().toISOString().split('T')[0],
+                trans_type: 'income',
+                category: 'debt_payment',
+                description: `รับชำระหนี้ (ลูกค้าเก่า)`,
+                amount: toPay,
+                payment_method: payment_method,
+                reference_order_id: account.order_id
+            }]);
 
             // Update account status
             const newPaid = parseFloat(account.paid_amount) + toPay;
@@ -945,9 +1141,9 @@ app.post('/api/check-due-notifications', async (req, res) => {
             customerDebts[customerId].dates.push(new Date(account.due_date));
         }
 
-        let created = 0;
         const today = new Date();
-        const todayStr = today.toISOString().split('T')[0];
+        const startOfDay = new Date(today);
+        startOfDay.setHours(0, 0, 0, 0);
 
         // 4. Check each customer status
         for (const customerId in customerDebts) {
@@ -964,24 +1160,28 @@ app.post('/api/check-due-notifications', async (req, res) => {
 
                 // 5. Create notification for EACH user
                 for (const userId of allUserIds) {
-                    // Check existing for this user/customer/day to avoid spam
+                    // Check existing for this user/customer
+                    // Avoid duplicate if: 
+                    // 1. There is an UNREAD notification for this customer
+                    // 2. OR any notification was created TODAY
                     const { data: existing } = await supabaseAdmin
                         .from('notifications')
                         .select('id')
                         .eq('user_id', userId)
                         .eq('store_id', storeId)
-                        .ilike('message', `%${data.name}%`) // Simple duplicate check
-                        .eq('is_read', false)
-                        .single();
+                        .eq('category', 'payment')
+                        .contains('payload', { phone: data.phone })
+                        .or(`is_read.eq.false,created_at.gte.${startOfDay.toISOString()}`)
+                        .limit(1);
 
-                    if (!existing) {
+                    if (!existing || existing.length === 0) {
                         await supabaseAdmin.from('notifications').insert([{
                             title,
                             message,
                             category: 'payment',
-                            payload: { phone: data.phone },
+                            payload: { phone: data.phone, customer_id: customerId },
                             store_id: storeId,
-                            user_id: userId, // Individual copy
+                            user_id: userId,
                             is_read: false
                         }]);
                         created++;
@@ -992,6 +1192,189 @@ app.post('/api/check-due-notifications', async (req, res) => {
 
         res.json({ success: true, created });
     } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ============================================================
+// 🔔 DAILY NOTIFICATION CHECK (Call from external cron daily)
+// Checks: Expiry, Near-Expiry, Payment Due, Promo Ending
+// ============================================================
+app.post('/api/notifications/daily-check', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+
+        if (!storeId) {
+            return res.status(400).json({ success: false, error: 'x-store-id header required' });
+        }
+
+        const today = new Date();
+        const todayStr = today.toISOString().split('T')[0];
+        const in3Days = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const in7Days = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const in2Days = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+        const results = {
+            expired: 0,
+            nearExpiry: 0,
+            paymentOverdue: 0,
+            paymentDueSoon: 0,
+            promoEnding: 0,
+            cleaned: 0
+        };
+
+        // Helper to call the database function
+        const createNotification = async (type, title, message, category, priority, referenceId, referenceType, payload) => {
+            try {
+                await supabaseAdmin.rpc('create_notification_for_store', {
+                    p_store_id: storeId,
+                    p_type: type,
+                    p_title: title,
+                    p_message: message,
+                    p_category: category,
+                    p_priority: priority,
+                    p_reference_id: referenceId,
+                    p_reference_type: referenceType,
+                    p_payload: payload
+                });
+                return true;
+            } catch (e) {
+                // Duplicate or other error, skip
+                return false;
+            }
+        };
+
+        // 1. Check EXPIRED batches
+        const { data: expiredBatches } = await supabaseAdmin
+            .from('product_batches')
+            .select('id, batch_no, expire_date, remaining_qty, products!inner(id, name, store_id)')
+            .eq('products.store_id', storeId)
+            .lt('expire_date', todayStr)
+            .gt('remaining_qty', 0);
+
+        for (const batch of expiredBatches || []) {
+            const daysExpired = Math.ceil((today - new Date(batch.expire_date)) / (1000 * 60 * 60 * 24));
+            let expiredText = daysExpired === 1 ? 'เมื่อวาน' :
+                daysExpired < 7 ? `${daysExpired} วันที่แล้ว` :
+                    daysExpired < 30 ? `${Math.ceil(daysExpired / 7)} สัปดาห์ที่แล้ว` :
+                        `${Math.ceil(daysExpired / 30)} เดือนที่แล้ว`;
+
+            const created = await createNotification(
+                'stock_expired', 'สินค้าหมดอายุ',
+                `${batch.products.name} (Lot #${batch.batch_no?.replace('LOT-', '') || batch.id.slice(0, 8)})\nหมดอายุ${expiredText} • ${batch.remaining_qty} ชิ้น`,
+                'stock', 'critical', batch.id, 'batch',
+                { batch_id: batch.id, product_id: batch.products.id, expire_date: batch.expire_date }
+            );
+            if (created) results.expired++;
+        }
+
+        // 2. Check NEAR-EXPIRY batches (within 7 days)
+        const { data: nearExpiryBatches } = await supabaseAdmin
+            .from('product_batches')
+            .select('id, batch_no, expire_date, remaining_qty, products!inner(id, name, store_id)')
+            .eq('products.store_id', storeId)
+            .gte('expire_date', todayStr)
+            .lte('expire_date', in7Days)
+            .gt('remaining_qty', 0);
+
+        for (const batch of nearExpiryBatches || []) {
+            const daysLeft = Math.ceil((new Date(batch.expire_date) - today) / (1000 * 60 * 60 * 24));
+            let expiryText = daysLeft === 0 ? 'หมดอายุวันนี้!' :
+                daysLeft === 1 ? 'หมดอายุพรุ่งนี้' :
+                    `หมดอายุใน ${daysLeft} วัน`;
+
+            const created = await createNotification(
+                'stock_near_expiry', 'สินค้าใกล้หมดอายุ',
+                `${batch.products.name}\n${expiryText} • เหลือ ${batch.remaining_qty} ชิ้น`,
+                'stock', daysLeft <= 2 ? 'high' : 'medium', batch.id, 'batch',
+                { batch_id: batch.id, product_id: batch.products.id, expire_date: batch.expire_date, days_left: daysLeft }
+            );
+            if (created) results.nearExpiry++;
+        }
+
+        // 3. Check OVERDUE payments
+        const { data: overdueAccounts } = await supabaseAdmin
+            .from('credit_accounts')
+            .select('id, customer_id, remaining_amount, due_date, customers_info!inner(name, phone, store_id)')
+            .eq('customers_info.store_id', storeId)
+            .lt('due_date', todayStr)
+            .gt('remaining_amount', 0)
+            .in('status', ['unpaid', 'partial', 'overdue']);
+
+        for (const acc of overdueAccounts || []) {
+            const daysOverdue = Math.ceil((today - new Date(acc.due_date)) / (1000 * 60 * 60 * 24));
+            const created = await createNotification(
+                'payment_overdue', 'ลูกหนี้เกินกำหนดชำระ',
+                `${acc.customers_info.name}\nค้างชำระ ฿${Number(acc.remaining_amount).toLocaleString()} • เกิน ${daysOverdue} วัน`,
+                'payment', 'critical', acc.customer_id, 'customer',
+                { customer_id: acc.customer_id, credit_account_id: acc.id, amount: acc.remaining_amount, days_overdue: daysOverdue }
+            );
+            if (created) results.paymentOverdue++;
+        }
+
+        // 4. Check payments DUE SOON (within 3 days)
+        const { data: dueSoonAccounts } = await supabaseAdmin
+            .from('credit_accounts')
+            .select('id, customer_id, remaining_amount, due_date, customers_info!inner(name, phone, store_id)')
+            .eq('customers_info.store_id', storeId)
+            .gte('due_date', todayStr)
+            .lte('due_date', in3Days)
+            .gt('remaining_amount', 0)
+            .in('status', ['unpaid', 'partial']);
+
+        for (const acc of dueSoonAccounts || []) {
+            const daysLeft = Math.ceil((new Date(acc.due_date) - today) / (1000 * 60 * 60 * 24));
+            let dueText = daysLeft === 0 ? 'ครบกำหนดวันนี้' :
+                daysLeft === 1 ? 'ครบกำหนดพรุ่งนี้' :
+                    `ครบกำหนดใน ${daysLeft} วัน`;
+
+            const created = await createNotification(
+                'payment_due_soon', 'ใกล้ครบกำหนดชำระ',
+                `${acc.customers_info.name}\nค้างชำระ ฿${Number(acc.remaining_amount).toLocaleString()} • ${dueText}`,
+                'payment', daysLeft === 0 ? 'high' : 'medium', acc.customer_id, 'customer',
+                { customer_id: acc.customer_id, credit_account_id: acc.id, amount: acc.remaining_amount, days_left: daysLeft }
+            );
+            if (created) results.paymentDueSoon++;
+        }
+
+        // 5. Check PROMO ENDING (within 2 days)
+        const { data: endingPromos } = await supabaseAdmin
+            .from('promotions')
+            .select('id, name, end_date')
+            .eq('store_id', storeId)
+            .gte('end_date', todayStr)
+            .lte('end_date', in2Days);
+
+        for (const promo of endingPromos || []) {
+            const daysLeft = Math.ceil((new Date(promo.end_date) - today) / (1000 * 60 * 60 * 24));
+            let endText = daysLeft === 0 ? 'หมดอายุวันนี้' :
+                daysLeft === 1 ? 'หมดอายุพรุ่งนี้' :
+                    `หมดอายุใน ${daysLeft} วัน`;
+
+            const created = await createNotification(
+                'promo_ending', 'โปรโมชั่นใกล้หมดอายุ',
+                `${promo.name}\n${endText}`,
+                'stock', 'medium', promo.id, 'promotion',
+                { promotion_id: promo.id, end_date: promo.end_date, days_left: daysLeft }
+            );
+            if (created) results.promoEnding++;
+        }
+
+        // 6. Cleanup old notifications (> 30 days)
+        const { count: cleanedCount } = await supabaseAdmin
+            .from('notifications')
+            .delete({ count: 'exact' })
+            .lt('expires_at', today.toISOString());
+
+        results.cleaned = cleanedCount || 0;
+
+        res.json({
+            success: true,
+            message: 'Daily check completed',
+            results
+        });
+    } catch (error) {
+        console.error('Daily Check Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -1111,20 +1494,231 @@ app.delete('/api/customers/:id', async (req, res) => {
     }
 });
 
+// ==================== SALES & TRANSACTION ENDPOINTS ====================
+
+// Unified Sale Endpoint (Cash, QR, Credit)
+app.post('/api/sales', async (req, res) => {
+    try {
+        const { items, paymentMethod, totalAmount, receivedAmount, customerId, customerName } = req.body;
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        if (!items || items.length === 0) return res.status(400).json({ success: false, error: 'No items in cart' });
+
+        // Validate Store Access
+        if (!await checkStoreAccess(storeId, userId)) {
+            return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
+        }
+
+        // 1. Create Order
+        const orderNo = `ORD-${Date.now().toString().slice(-8)}`; // Simple Order No
+        const { data: order, error: orderError } = await supabaseAdmin
+            .from('orders')
+            .insert([{
+                order_no: orderNo,
+                customer_id: customerId || null,
+                total_amount: totalAmount,
+                payment_status: paymentMethod === 'credit' ? 'pending' : 'paid',
+                payment_type: paymentMethod === 'credit' ? 'credit_sale' : 'cash_sale', // Distinguish credit vs cash/qr
+                store_id: storeId,
+                client_created_at: new Date().toISOString()
+            }])
+            .select()
+            .single();
+
+        if (orderError) throw orderError;
+
+        // 2. Process Items & Deduct Stock
+        const orderItems = [];
+
+        for (const item of items) {
+            let qtyToDeduct = parseFloat(item.quantity);
+            const productId = item.id;
+            const price = parseFloat(item.price);
+
+            // 2.1 Get Product Batches (FIFO: Expiring First)
+            const { data: batches, error: batchFetchError } = await supabaseAdmin
+                .from('product_batches')
+                .select('*')
+                .eq('product_id', productId)
+                .gt('remaining_qty', 0)
+                .order('expire_date', { ascending: true, nullsFirst: false }); // Nulls (no expire) last
+
+            if (batchFetchError) throw batchFetchError;
+
+            // 2.2 Deduct from Batches (Split logic)
+            let remainingToFulfill = qtyToDeduct;
+
+            // If no batches exist (or stock is messed up), we still record the sale but maybe negative stock or null batch
+            // For this logic, if we have batches, we use them. If not, we record a "No Batch" item.
+
+            if (!batches || batches.length === 0) {
+                // Case: No batches available (Stock might be 0 or just not tracked in batches)
+                // Just create one order item with null batch
+                const subtotal = qtyToDeduct * price;
+                await supabaseAdmin.from('order_items').insert([{
+                    order_id: order.id,
+                    product_id: productId,
+                    qty: qtyToDeduct,
+                    price_per_unit: price,
+                    subtotal: subtotal,
+                    batch_id: null
+                }]);
+            } else {
+                for (const batch of batches) {
+                    if (remainingToFulfill <= 0) break;
+
+                    const availableInBatch = parseFloat(batch.remaining_qty);
+                    const deductAmount = Math.min(remainingToFulfill, availableInBatch);
+
+                    // Update Batch
+                    await supabaseAdmin
+                        .from('product_batches')
+                        .update({ remaining_qty: availableInBatch - deductAmount })
+                        .eq('id', batch.id);
+
+                    // Insert Inventory Log
+                    await supabaseAdmin.from('inventory_transactions').insert([{
+                        product_id: productId,
+                        batch_id: batch.id,
+                        trans_type: 'out',
+                        qty: deductAmount,
+                        reference_type: 'sale',
+                        reference_id: order.id,
+                        notes: `Sale Order: ${orderNo}`
+                    }]);
+
+                    // Insert Order Item (Split by batch)
+                    const subtotal = deductAmount * price;
+                    await supabaseAdmin.from('order_items').insert([{
+                        order_id: order.id,
+                        product_id: productId,
+                        qty: deductAmount,
+                        price_per_unit: price,
+                        subtotal: subtotal,
+                        batch_id: batch.id
+                    }]);
+
+                    remainingToFulfill -= deductAmount;
+                }
+
+                // If still remaining (more sold than in batches), record the rest as null batch
+                if (remainingToFulfill > 0) {
+                    const subtotal = remainingToFulfill * price;
+                    await supabaseAdmin.from('order_items').insert([{
+                        order_id: order.id,
+                        product_id: productId,
+                        qty: remainingToFulfill,
+                        price_per_unit: price,
+                        subtotal: subtotal,
+                        batch_id: null
+                    }]);
+                }
+            }
+
+            // 2.3 Update Main Product Stock
+            const { data: product } = await supabaseAdmin.from('products').select('stock_qty').eq('id', productId).single();
+            const currentStock = parseFloat(product?.stock_qty || 0);
+            await supabaseAdmin
+                .from('products')
+                .update({ stock_qty: currentStock - qtyToDeduct })
+                .eq('id', productId);
+        }
+
+                    // 3. Record Payment (if not credit sale or if partial/full payment made)
+                if (paymentMethod !== 'credit') {
+                    const { error: paymentError } = await supabaseAdmin
+                        .from('payments')
+                        .insert([{
+                            order_id: order.id,
+                            method: paymentMethod === 'qr' ? 'qr_promptpay' : 'cash',
+                            amount: totalAmount, // For simple sales, amount = total. Change handling is frontend mostly, or separate log.
+                            paid_at: new Date().toISOString()
+                        }]);
+        
+                    if (paymentError) throw paymentError;
+        
+                    // AUTO-SYNC: Record Income in General Ledger
+                    await supabaseAdmin.from('account_transactions').insert([{
+                        store_id: storeId,
+                        trans_date: new Date().toISOString().split('T')[0],
+                        trans_type: 'income',
+                        category: 'sales',
+                        description: `ขายสินค้า Order #${orderNo}`,
+                        amount: totalAmount,
+                        payment_method: paymentMethod === 'qr' ? 'qr_promptpay' : 'cash',
+                        reference_order_id: order.id
+                    }]);
+                } else {            // Logic for Credit Sale (Create Credit Account)
+            // Reusing logic from credit-sales if needed, or keeping it separate. 
+            // *User requested Normal Sales first, so Credit logic is basic here or handled by /credit-sales*
+            // For now, if someone sends 'credit' to this endpoint, we just create the order but NO payment record.
+            // AND we need to create the credit_account entry.
+            if (customerId) {
+                await supabaseAdmin.from('credit_accounts').insert([{
+                    order_id: order.id,
+                    customer_id: customerId,
+                    total_debt: totalAmount,
+                    paid_amount: 0,
+                    remaining_amount: totalAmount,
+                    due_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // Default 30 days if not specified
+                    status: 'unpaid'
+                }]);
+            }
+        }
+
+        // 4. Get Final Order with Items and Store Info for Receipt
+        const { data: finalOrder, error: finalError } = await supabaseAdmin
+            .from('orders')
+            .select(`
+                *,
+                stores (name, address, phone),
+                order_items (
+                    qty,
+                    price_per_unit,
+                    subtotal,
+                    products (name)
+                )
+            `)
+            .eq('id', order.id)
+            .single();
+
+        if (finalError) throw finalError;
+
+        res.json({ success: true, data: finalOrder });
+
+    } catch (error) {
+        console.error('Sale Process Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.post('/api/credit-sales', async (req, res) => {
     try {
+        console.log('Received credit-sale request:', req.body);
         const { customer_name, customer_phone, due_date, amount, items, customer_id, is_new_customer, customer_image } = req.body;
         const storeId = req.headers['x-store-id'];
+
+        if (!storeId) {
+            console.error('Credit Sale Error: Missing store_id');
+            return res.status(400).json({ success: false, error: 'Store ID required' });
+        }
 
         let customer;
 
         // Use existing customer if customer_id provided
         if (customer_id) {
-            const { data: existingCustomer } = await supabaseAdmin
+            const { data: existingCustomer, error: fetchError } = await supabaseAdmin
                 .from('customers_info')
                 .select('*')
                 .eq('id', customer_id)
                 .single();
+
+            if (fetchError || !existingCustomer) {
+                console.error('Customer fetch error:', fetchError);
+                return res.status(404).json({ success: false, error: 'Customer not found' });
+            }
             customer = existingCustomer;
 
             // Update image if provided and different (or just update to be sure)
@@ -1138,20 +1732,24 @@ app.post('/api/credit-sales', async (req, res) => {
 
                 if (!updateError) {
                     customer = updatedCustomer;
+                } else {
+                    console.error('Update customer image error:', updateError);
                 }
             }
         } else {
             // Search by phone within the same store
-            const { data: existingCustomer } = await supabaseAdmin
+            const { data: existingCustomer, error: searchError } = await supabaseAdmin
                 .from('customers_info')
                 .select('*')
                 .eq('phone', customer_phone)
                 .eq('store_id', storeId)
-                .single();
+                .maybeSingle(); // Use maybeSingle to avoid error on 0 rows
 
             if (existingCustomer) {
                 customer = existingCustomer;
+                console.log('Found existing customer by phone:', customer.id);
             } else {
+                console.log('Creating new customer:', customer_name);
                 // Create new customer with store_id
                 const { data: newCustomer, error: customerError } = await supabaseAdmin
                     .from('customers_info')
@@ -1163,12 +1761,15 @@ app.post('/api/credit-sales', async (req, res) => {
                     }])
                     .select()
                     .single();
-                if (customerError) throw customerError;
+                if (customerError) {
+                    console.error('Create customer error:', customerError);
+                    throw customerError;
+                }
                 customer = newCustomer;
             }
         }
 
-        const orderNo = `ORD${Date.now().toString().slice(-8)}`;
+        const orderNo = `ORD-${Date.now().toString().slice(-8)}`;
         const { data: order, error: orderError } = await supabaseAdmin
             .from('orders')
             .insert([{
@@ -1178,10 +1779,103 @@ app.post('/api/credit-sales', async (req, res) => {
                 payment_status: 'pending',
                 payment_type: 'credit_sale',
                 store_id: storeId,
+                client_created_at: new Date().toISOString()
             }])
             .select()
             .single();
-        if (orderError) throw orderError;
+        if (orderError) {
+            console.error('Create order error:', orderError);
+            throw orderError;
+        }
+
+        // --- Process Items & Deduct Stock (Copied from Normal Sale) ---
+        if (items && items.length > 0) {
+            for (const item of items) {
+                let qtyToDeduct = parseFloat(item.quantity);
+                const productId = item.id;
+                const price = parseFloat(item.price);
+
+                // Get Product Batches (FIFO)
+                const { data: batches } = await supabaseAdmin
+                    .from('product_batches')
+                    .select('*')
+                    .eq('product_id', productId)
+                    .gt('remaining_qty', 0)
+                    .order('expire_date', { ascending: true, nullsFirst: false });
+
+                let remainingToFulfill = qtyToDeduct;
+
+                if (!batches || batches.length === 0) {
+                    const subtotal = qtyToDeduct * price;
+                    await supabaseAdmin.from('order_items').insert([{
+                        order_id: order.id,
+                        product_id: productId,
+                        qty: qtyToDeduct,
+                        price_per_unit: price,
+                        subtotal: subtotal,
+                        batch_id: null
+                    }]);
+                } else {
+                    for (const batch of batches) {
+                        if (remainingToFulfill <= 0) break;
+
+                        const availableInBatch = parseFloat(batch.remaining_qty);
+                        const deductAmount = Math.min(remainingToFulfill, availableInBatch);
+
+                        // Update Batch
+                        await supabaseAdmin
+                            .from('product_batches')
+                            .update({ remaining_qty: availableInBatch - deductAmount })
+                            .eq('id', batch.id);
+
+                        // Insert Inventory Log
+                        await supabaseAdmin.from('inventory_transactions').insert([{
+                            product_id: productId,
+                            batch_id: batch.id,
+                            trans_type: 'out',
+                            qty: deductAmount,
+                            reference_type: 'sale',
+                            reference_id: order.id,
+                            notes: `Credit Sale: ${orderNo}`
+                        }]);
+
+                        // Insert Order Item
+                        const subtotal = deductAmount * price;
+                        await supabaseAdmin.from('order_items').insert([{
+                            order_id: order.id,
+                            product_id: productId,
+                            qty: deductAmount,
+                            price_per_unit: price,
+                            subtotal: subtotal,
+                            batch_id: batch.id
+                        }]);
+
+                        remainingToFulfill -= deductAmount;
+                    }
+
+                    if (remainingToFulfill > 0) {
+                        const subtotal = remainingToFulfill * price;
+                        await supabaseAdmin.from('order_items').insert([{
+                            order_id: order.id,
+                            product_id: productId,
+                            qty: remainingToFulfill,
+                            price_per_unit: price,
+                            subtotal: subtotal,
+                            batch_id: null
+                        }]);
+                    }
+                }
+
+                // Update Main Product Stock
+                const { data: product } = await supabaseAdmin.from('products').select('stock_qty').eq('id', productId).single();
+                const currentStock = parseFloat(product?.stock_qty || 0);
+                await supabaseAdmin
+                    .from('products')
+                    .update({ stock_qty: currentStock - qtyToDeduct })
+                    .eq('id', productId);
+            }
+        }
+        // -----------------------------------------------------------
 
         const { data: creditAccount, error: creditError } = await supabaseAdmin
             .from('credit_accounts')
@@ -1196,7 +1890,10 @@ app.post('/api/credit-sales', async (req, res) => {
             }])
             .select()
             .single();
-        if (creditError) throw creditError;
+        if (creditError) {
+            console.error('Create credit account error:', creditError);
+            throw creditError;
+        }
 
         res.json({
             success: true,
@@ -1207,7 +1904,7 @@ app.post('/api/credit-sales', async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('Credit sale error:', error);
+        console.error('Credit sale error (Catch):', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -1587,6 +2284,432 @@ app.post('/api/products', async (req, res) => {
 // Global 404 Handler
 app.use((req, res) => {
     res.status(404).json({ success: false, error: 'Endpoint not found' });
+});
+
+// ==================== REPORTS ENDPOINTS ====================
+
+// Helper for date ranges
+const getDateRange = (period) => {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+    let start, end;
+
+    if (period === 'today' || period === 'day') {
+        start = today.toISOString();
+        end = endOfDay.toISOString();
+    } else if (period === 'month') {
+        start = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+        end = endOfDay.toISOString();
+    } else if (period === 'year') {
+        start = new Date(now.getFullYear(), 0, 1).toISOString();
+        end = endOfDay.toISOString();
+    } else if (period === 'week') {
+        // Start of week (Monday)
+        const day = now.getDay() || 7; // Get current day number, converting Sun (0) to 7
+        if (day !== 1) now.setHours(-24 * (day - 1));
+        now.setHours(0, 0, 0, 0);
+        start = now.toISOString();
+        end = endOfDay.toISOString();
+    }
+
+    return { start, end };
+};
+
+// 1. Sales Summary (Total Sales, Total Orders, Growth)
+app.get('/api/reports/sales-summary', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+        const { period = 'today' } = req.query; // today, month, year
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+        const { start, end } = getDateRange(period);
+
+        // Current Period Sales
+        const { data: currentData, error: currentError } = await supabaseAdmin
+            .from('orders')
+            .select('total_amount')
+            .eq('store_id', storeId)
+            .eq('payment_status', 'paid')
+            .gte('created_at', start)
+            .lte('created_at', end);
+
+        if (currentError) throw currentError;
+
+        const totalSales = currentData.reduce((sum, order) => sum + (parseFloat(order.total_amount) || 0), 0);
+        const totalOrders = currentData.length;
+
+        // Previous Period Sales (for growth calculation)
+        // Simply comparing today vs yesterday, this month vs last month
+        let prevStart, prevEnd;
+        const now = new Date();
+
+        if (period === 'today') {
+            const yesterday = new Date(now);
+            yesterday.setDate(now.getDate() - 1);
+            yesterday.setHours(0, 0, 0, 0);
+            prevStart = yesterday.toISOString();
+
+            const yesterdayEnd = new Date(now);
+            yesterdayEnd.setDate(now.getDate() - 1);
+            yesterdayEnd.setHours(23, 59, 59, 999);
+            prevEnd = yesterdayEnd.toISOString();
+        } else if (period === 'month') {
+            const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            prevStart = lastMonth.toISOString();
+            const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+            prevEnd = lastMonthEnd.toISOString();
+        }
+
+        let growth = 0;
+        if (prevStart && prevEnd) {
+            const { data: prevData } = await supabaseAdmin
+                .from('orders')
+                .select('total_amount')
+                .eq('store_id', storeId)
+                .eq('payment_status', 'paid')
+                .gte('created_at', prevStart)
+                .lte('created_at', prevEnd);
+
+            const prevSales = prevData?.reduce((sum, order) => sum + (parseFloat(order.total_amount) || 0), 0) || 0;
+
+            if (prevSales > 0) {
+                growth = ((totalSales - prevSales) / prevSales) * 100;
+            } else if (totalSales > 0) {
+                growth = 100;
+            }
+        }
+
+        res.json({
+            success: true,
+            data: {
+                totalSales,
+                totalOrders,
+                growth: Math.round(growth)
+            }
+        });
+    } catch (error) {
+        console.error('Sales Summary Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// 2. Sales Chart Data
+app.get('/api/reports/sales-chart', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+        const { period = 'today' } = req.query;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+        const { start, end } = getDateRange(period);
+
+        // Fetch all paid orders in range
+        const { data: orders, error } = await supabaseAdmin
+            .from('orders')
+            .select('created_at, total_amount')
+            .eq('store_id', storeId)
+            .eq('payment_status', 'paid')
+            .gte('created_at', start)
+            .lte('created_at', end)
+            .order('created_at', { ascending: true });
+
+        if (error) throw error;
+
+        let labels = [];
+        let values = [];
+        let peakTime = '-';
+        let peakAmount = 0;
+
+        if (period === 'today') {
+            // Group by hour
+            const hourlyData = new Array(24).fill(0);
+            orders.forEach(order => {
+                const hour = new Date(order.created_at).getUTCHours() + 7; // Adjust for UTC+7 (Thailand) roughly, or better use client time. 
+                // For simplicity assuming server is UTC and we want +7 display. 
+                // Better: Parse date properly.
+                const localDate = new Date(order.created_at);
+                // Simple localized hour:
+                const localHour = (localDate.getHours() + 7) % 24; // Mocking Timezone adjustment if server is UTC.
+                // Assuming database stores UTC.
+                // NOTE: Proper way is to handle TZ in query or use a library. 
+                // For this quick impl, we'll map created_at string directly if it has offset, or assume UTC.
+                // Let's assume input is UTC.
+
+                // Hacky TZ adjust +7
+                const date = new Date(order.created_at);
+                date.setHours(date.getHours() + 7);
+                const h = date.getHours();
+                hourlyData[h] += parseFloat(order.total_amount);
+            });
+
+            // Filter to show active range (e.g. 06:00 to 22:00 or current time)
+            // Showing simplifed: 09:00, 12:00, 15:00, 18:00, 21:00
+            const keyHours = [9, 12, 15, 18, 21];
+            labels = keyHours.map(h => `${h}:00`);
+            values = keyHours.map(h => hourlyData[h]);
+
+            // Find peak
+            let maxVal = 0;
+            let maxIdx = 0;
+            hourlyData.forEach((val, idx) => {
+                if (val > maxVal) {
+                    maxVal = val;
+                    maxIdx = idx;
+                }
+            });
+            peakAmount = maxVal;
+            peakTime = `${maxIdx}:00 น.`;
+
+        } else if (period === 'week' || period === 'month') {
+            // Group by Day
+            const dailyData = {};
+            orders.forEach(order => {
+                // Adjust +7
+                const date = new Date(order.created_at);
+                date.setHours(date.getHours() + 7);
+                const dayStr = `${date.getDate()}/${date.getMonth() + 1}`;
+                dailyData[dayStr] = (dailyData[dayStr] || 0) + parseFloat(order.total_amount);
+            });
+
+            labels = Object.keys(dailyData);
+            values = Object.values(dailyData);
+
+            // Find peak
+            let maxVal = 0;
+            let maxKey = '-';
+            for (const [key, val] of Object.entries(dailyData)) {
+                if (val > maxVal) {
+                    maxVal = val;
+                    maxKey = key;
+                }
+            }
+            peakAmount = maxVal;
+            peakTime = maxKey;
+        }
+
+        // If no data, return empty zeros
+        if (values.length === 0) {
+            labels = ['09:00', '12:00', '15:00', '18:00', '21:00'];
+            values = [0, 0, 0, 0, 0];
+        }
+
+        res.json({
+            success: true,
+            data: {
+                labels,
+                values,
+                peakTime,
+                peakAmount
+            }
+        });
+
+    } catch (error) {
+        console.error('Sales Chart Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// 3. Payment Methods Breakdown
+app.get('/api/reports/payment-methods', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+        const { period = 'today' } = req.query;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+        const { start, end } = getDateRange(period);
+
+        // Fetch payments joined with orders to filter by store
+        const { data: payments, error } = await supabaseAdmin
+            .from('payments')
+            .select(`
+                amount,
+                method,
+                orders!inner(store_id)
+            `)
+            .eq('orders.store_id', storeId)
+            .gte('paid_at', start)
+            .lte('paid_at', end);
+
+        if (error) throw error;
+
+        const stats = {
+            cash: 0,
+            qr: 0,
+            credit: 0
+        };
+
+        let total = 0;
+
+        payments.forEach(p => {
+            const amount = parseFloat(p.amount) || 0;
+            total += amount;
+            if (p.method === 'cash') stats.cash += amount;
+            else if (p.method === 'qr_promptpay') stats.qr += amount;
+            else if (p.method === 'credit') stats.credit += amount;
+        });
+
+        const formatPercent = (val) => total > 0 ? Math.round((val / total) * 100) : 0;
+
+        res.json({
+            success: true,
+            data: {
+                cash: { amount: stats.cash, percent: formatPercent(stats.cash) },
+                qr: { amount: stats.qr, percent: formatPercent(stats.qr) },
+                credit: { amount: stats.credit, percent: formatPercent(stats.credit) }
+            }
+        });
+    } catch (error) {
+        console.error('Payment Report Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// 4. Recent Transactions
+app.get('/api/reports/recent-orders', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+        const { data: orders, error } = await supabaseAdmin
+            .from('orders')
+            .select(`
+                id,
+                order_no,
+                total_amount,
+                created_at,
+                payment_status,
+                customers_info(name)
+            `)
+            .eq('store_id', storeId)
+            .eq('payment_status', 'paid')
+            .order('created_at', { ascending: false })
+            .limit(10);
+
+        if (error) throw error;
+
+        const formatted = orders.map(o => ({
+            id: o.id,
+            orderNo: o.order_no,
+            customer: o.customers_info?.name || 'ลูกค้าทั่วไป',
+            amount: parseFloat(o.total_amount),
+            time: new Date(o.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }),
+            date: new Date(o.created_at).toLocaleDateString('th-TH')
+        }));
+
+        res.json({ success: true, data: formatted });
+    } catch (error) {
+        console.error('Recent Orders Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==================== TRANSACTION / EXPENSE MANAGEMENT ====================
+
+// Get Transactions (Income/Expense)
+app.get('/api/transactions', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+        const { type, startDate, endDate, limit = 50 } = req.query;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+        let query = supabaseAdmin
+            .from('account_transactions')
+            .select('*')
+            .eq('store_id', storeId)
+            .order('trans_date', { ascending: false })
+            .order('created_at', { ascending: false })
+            .limit(parseInt(limit));
+
+        if (type && type !== 'all') {
+            query = query.eq('trans_type', type);
+        }
+
+        if (startDate) query = query.gte('trans_date', startDate);
+        if (endDate) query = query.lte('trans_date', endDate);
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        res.json({ success: true, data });
+    } catch (error) {
+        console.error('Get Transactions Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Create Transaction (Expense or Extra Income)
+app.post('/api/transactions', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+        const { trans_date, trans_type, category, description, amount, payment_method } = req.body;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+        const { data, error } = await supabaseAdmin
+            .from('account_transactions')
+            .insert([{
+                store_id: storeId,
+                trans_date: trans_date || new Date().toISOString().split('T')[0],
+                trans_type, // 'income' or 'expense'
+                category,
+                description,
+                amount,
+                payment_method
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.json({ success: true, data });
+    } catch (error) {
+        console.error('Create Transaction Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Delete/Void Transaction
+app.delete('/api/transactions/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const storeId = req.headers['x-store-id'];
+        const userId = req.user.id;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+        
+        if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+        const { error } = await supabaseAdmin
+            .from('account_transactions')
+            .delete()
+            .eq('id', id)
+            .eq('store_id', storeId); // Security
+
+        if (error) throw error;
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Delete Transaction Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
 app.listen(PORT, () => {
