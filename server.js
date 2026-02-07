@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3000;
 
 app.set('trust proxy', 1); // Enable trust proxy for Render/Load Balancers
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(helmet());
 
 // Temporary Migration Endpoint: Claim Orphans
@@ -151,17 +152,25 @@ async function signUrlIfNeeded(urlOrPath, bucket) {
     return data.signedUrl;
 }
 
-function convertDateFormat(ddmmyy) {
-    const [day, month, year] = ddmmyy.split('/');
-    return `${year}-${month}-${day}`;
-}
+// Helper to format date for SQL (YYYY-MM-DD)
+const convertDateFormat = (dateInput) => {
+    if (!dateInput) return null;
+    try {
+        const d = new Date(dateInput);
+        if (isNaN(d.getTime())) return null; // Invalid date
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    } catch (e) {
+        console.error("Date conversion error", e);
+        return null;
+    }
+};
 const { encrypt, decrypt } = require('./utils/crypto');
 const promptpay = require('promptpay-qr');
 
-function convertDateFormat(ddmmyy) {
-    const [day, month, year] = ddmmyy.split('/');
-    return `${year}-${month}-${day}`;
-}
+
 app.use('/api', authMiddleware);
 app.use('/api', rateLimiter); // Apply rate limiting to all API routes
 
@@ -1626,31 +1635,31 @@ app.post('/api/sales', async (req, res) => {
                 .eq('id', productId);
         }
 
-                    // 3. Record Payment (if not credit sale or if partial/full payment made)
-                if (paymentMethod !== 'credit') {
-                    const { error: paymentError } = await supabaseAdmin
-                        .from('payments')
-                        .insert([{
-                            order_id: order.id,
-                            method: paymentMethod === 'qr' ? 'qr_promptpay' : 'cash',
-                            amount: totalAmount, // For simple sales, amount = total. Change handling is frontend mostly, or separate log.
-                            paid_at: new Date().toISOString()
-                        }]);
-        
-                    if (paymentError) throw paymentError;
-        
-                    // AUTO-SYNC: Record Income in General Ledger
-                    await supabaseAdmin.from('account_transactions').insert([{
-                        store_id: storeId,
-                        trans_date: new Date().toISOString().split('T')[0],
-                        trans_type: 'income',
-                        category: 'sales',
-                        description: `ขายสินค้า Order #${orderNo}`,
-                        amount: totalAmount,
-                        payment_method: paymentMethod === 'qr' ? 'qr_promptpay' : 'cash',
-                        reference_order_id: order.id
-                    }]);
-                } else {            // Logic for Credit Sale (Create Credit Account)
+        // 3. Record Payment (if not credit sale or if partial/full payment made)
+        if (paymentMethod !== 'credit') {
+            const { error: paymentError } = await supabaseAdmin
+                .from('payments')
+                .insert([{
+                    order_id: order.id,
+                    method: paymentMethod === 'qr' ? 'qr_promptpay' : 'cash',
+                    amount: totalAmount, // For simple sales, amount = total. Change handling is frontend mostly, or separate log.
+                    paid_at: new Date().toISOString()
+                }]);
+
+            if (paymentError) throw paymentError;
+
+            // AUTO-SYNC: Record Income in General Ledger
+            await supabaseAdmin.from('account_transactions').insert([{
+                store_id: storeId,
+                trans_date: new Date().toISOString().split('T')[0],
+                trans_type: 'income',
+                category: 'sales',
+                description: `ขายสินค้า Order #${orderNo}`,
+                amount: totalAmount,
+                payment_method: paymentMethod === 'qr' ? 'qr_promptpay' : 'cash',
+                reference_order_id: order.id
+            }]);
+        } else {            // Logic for Credit Sale (Create Credit Account)
             // Reusing logic from credit-sales if needed, or keeping it separate. 
             // *User requested Normal Sales first, so Credit logic is basic here or handled by /credit-sales*
             // For now, if someone sends 'credit' to this endpoint, we just create the order but NO payment record.
@@ -1917,7 +1926,7 @@ app.use('/uploads', require('express').static('uploads'));
 
 
 
-// Get paginated products with optional search
+// Get paginated products with optional search and type filter
 app.get('/api/products', async (req, res) => {
     try {
         const storeId = req.headers['x-store-id'];
@@ -1926,6 +1935,8 @@ app.get('/api/products', async (req, res) => {
         const limit = parseInt(req.query.limit) || 20;
         const search = req.query.search || '';
         const categoryId = req.query.categoryId || null;
+        // type: 'normal' (default) | 'weight' | 'all'
+        const type = req.query.type || 'normal';
         const offset = (page - 1) * limit;
 
         if (!storeId) {
@@ -1941,6 +1952,14 @@ app.get('/api/products', async (req, res) => {
             .select('id, barcode, name, price, stock_qty, image_url, category_id, is_weightable, unit_type')
             .order('name', { ascending: true })
             .eq('store_id', storeId);
+
+        // Filter by Type
+        if (type === 'normal') {
+            query = query.eq('is_weightable', false);
+        } else if (type === 'weight') {
+            query = query.eq('is_weightable', true);
+        }
+        // if type === 'all', no filter applied
 
         if (categoryId) {
             query = query.eq('category_id', categoryId);
@@ -2223,7 +2242,7 @@ app.delete('/api/product-categories/:id', async (req, res) => {
 app.post('/api/products', async (req, res) => {
     try {
         // Now receives JSON body instead of multipart/form-data
-        const { code, name, categoryId, quantity, costPrice, salePrice, lowStockThreshold, unitType, expireDate, imageUrl } = req.body;
+        const { code, name, categoryId, quantity, costPrice, salePrice, lowStockThreshold, unitType, expireDate, imageUrl, isWeightable } = req.body;
         const storeId = req.headers['x-store-id'];
 
         // Validate required fields
@@ -2242,10 +2261,46 @@ app.post('/api/products', async (req, res) => {
                 cost_price: parseFloat(costPrice) || 0,
                 price: parseFloat(salePrice) || 0,
                 low_stock_threshold: parseFloat(lowStockThreshold) || 0,
-                unit_type: unitType || 'ชิ้น',
+                unit_type: isWeightable ? 'kg' : (unitType || 'ชิ้น'),
                 store_id: storeId,
-                image_url: imageUrl || null, // Supabase Storage URL from frontend
-                is_weightable: false
+                store_id: storeId,
+                image_url: await (async () => {
+                    if (imageUrl && imageUrl.startsWith('data:image')) {
+                        try {
+                            // 1. Decode Base64
+                            const base64Data = imageUrl.split(',')[1];
+                            const buffer = Buffer.from(base64Data, 'base64');
+
+                            // 2. Generate path with folder (store_id/filename.jpg)
+                            // MATCHING FRONTEND PATTERN: product-timestamp.jpg
+                            const fileName = `${storeId}/product-${Date.now()}.jpg`;
+
+                            // 3. Upload to Supabase Storage
+                            const { data: uploadData, error: uploadError } = await supabaseAdmin
+                                .storage
+                                .from('products')
+                                .upload(fileName, buffer, {
+                                    contentType: 'image/jpeg',
+                                    upsert: true
+                                });
+
+                            if (uploadError) throw uploadError;
+
+                            // 3. Get Public URL (Store this in DB like the Stock system does)
+                            const { data: publicUrlData } = supabaseAdmin
+                                .storage
+                                .from('products')
+                                .getPublicUrl(fileName);
+
+                            return publicUrlData.publicUrl;
+                        } catch (e) {
+                            console.error("Image Upload Error:", e);
+                            return null; // Fallback to null if upload fails
+                        }
+                    }
+                    return imageUrl || null; // Return original if not base64 or null
+                })(),
+                is_weightable: !!isWeightable // Force boolean
             }])
             .select()
             .single();
@@ -2254,7 +2309,10 @@ app.post('/api/products', async (req, res) => {
 
         // 2. Insert Batch (if quantity > 0)
         const qty = parseFloat(quantity) || 0;
+        //console.log(`[AddProduct] Name: ${name}, Qty Input: ${quantity}, Parsed Qty: ${qty}`); // DEBUG LOG
+
         if (qty > 0) {
+            //console.log(`[AddProduct] Creating batch for ${product.id} with qty ${qty}`); // DEBUG LOG
             const batchNo = `LOT-${Date.now()}`;
             const { error: batchError } = await supabaseAdmin
                 .from('product_batches')
@@ -2691,7 +2749,7 @@ app.delete('/api/transactions/:id', async (req, res) => {
         const userId = req.user.id;
 
         if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
-        
+
         if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
 
         const { error } = await supabaseAdmin
@@ -2713,6 +2771,8 @@ app.delete('/api/transactions/:id', async (req, res) => {
 app.use((req, res) => {
     res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
+
+
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
