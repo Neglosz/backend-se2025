@@ -9,6 +9,7 @@ const { productValidators, categoryValidators, creditPaymentValidators } = requi
 const { createClient } = require('@supabase/supabase-js');
 
 const branchesRoutes = require('./routes/branches');
+const aiRoutes = require('./routes/ai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -169,6 +170,118 @@ const convertDateFormat = (dateInput) => {
 };
 const { encrypt, decrypt } = require('./utils/crypto');
 const promptpay = require('promptpay-qr');
+
+// Helper to Get Store Users (Owner + Managers)
+const getStoreUsers = async (storeId) => {
+    try {
+        const { data: store } = await supabaseAdmin
+            .from('stores')
+            .select('owner_id')
+            .eq('id', storeId)
+            .single();
+
+        const { data: members } = await supabaseAdmin
+            .from('store_members')
+            .select('user_id')
+            .eq('store_id', storeId);
+
+        const ids = [store?.owner_id, ...members?.map(m => m.user_id)].filter(Boolean);
+        return [...new Set(ids)]; // Unique IDs
+    } catch (e) {
+        console.error("getStoreUsers Error:", e);
+        return [];
+    }
+};
+
+// Global Helper: Upsert Notification (Smart Update - Production Grade)
+const upsertNotificationGlobal = async (storeId, type, title, message, category, priority, referenceId, referenceType, payload) => {
+    try {
+        const userIds = await getStoreUsers(storeId);
+        let createdCount = 0;
+
+        for (const userId of userIds) {
+            // Check for existing notification (same type + same reference for this user)
+            // Fetch title and message to compare
+            const { data: existing } = await supabaseAdmin
+                .from('notifications')
+                .select('id, title, message')
+                .eq('user_id', userId)
+                .eq('type', type)
+                .eq('reference_id', referenceId)
+                .eq('reference_type', referenceType)
+                .maybeSingle();
+
+            if (existing) {
+                // Only update if content HAS CHANGED
+                if (existing.title !== title || existing.message !== message) {
+                    await supabaseAdmin
+                        .from('notifications')
+                        .update({
+                            title,
+                            message,
+                            payload,
+                            priority,
+                            is_read: false, // Reset to unread because info changed
+                            created_at: new Date().toISOString() // Bump to top because info changed
+                        })
+                        .eq('id', existing.id);
+                    createdCount++;
+                }
+                // If content is same, do NOTHING. Preserves original created_at and is_read status.
+            } else {
+                // Insert new
+                await supabaseAdmin.from('notifications').insert([{
+                    store_id: storeId,
+                    user_id: userId,
+                    type,
+                    title,
+                    message,
+                    category,
+                    priority,
+                    reference_id: referenceId,
+                    reference_type: referenceType,
+                    payload,
+                    is_read: false,
+                    expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+                }]);
+                createdCount++;
+            }
+        }
+        return createdCount > 0;
+    } catch (e) {
+        console.error("upsertNotificationGlobal Error:", e);
+        return false;
+    }
+};
+
+
+// Global Helper: Delete Notification (Auto-Resolve)
+const deleteNotificationGlobal = async (storeId, types, referenceId, referenceType) => {
+    try {
+        const typeArray = Array.isArray(types) ? types : [types];
+        const userIds = await getStoreUsers(storeId);
+
+        // Find notifications matching the criteria
+        const { data: toDelete, error } = await supabaseAdmin
+            .from('notifications')
+            .select('id')
+            .in('user_id', userIds)
+            .eq('store_id', storeId)
+            .in('type', typeArray)
+            .eq('reference_id', referenceId)
+            .eq('reference_type', referenceType);
+
+        if (toDelete && toDelete.length > 0) {
+            const ids = toDelete.map(n => n.id);
+            await supabaseAdmin.from('notifications').delete().in('id', ids);
+            // console.log(`[Auto-Resolve] Deleted ${ids.length} notifications for Ref: ${referenceId}`);
+        }
+        return true;
+    } catch (e) {
+        console.error("deleteNotificationGlobal Error:", e);
+        return false;
+    }
+};
 
 
 app.use('/api', authMiddleware);
@@ -767,42 +880,26 @@ app.post('/api/stock/check-notifications', async (req, res) => {
             }
         }
 
-        // 6. Insert notifications for EACH user (same as payment notifications)
+        // 6. Upsert notifications (uses the global helper for deduplication)
         let created = 0;
-        const startOfDay = new Date();
-        startOfDay.setHours(0, 0, 0, 0);
 
         for (const notif of notifications) {
             const refId = notif.payload.batch_id || notif.payload.product_id;
+            const refType = notif.payload.batch_id ? 'batch' : 'product';
+            const priority = notif.type === 'stock_expired' || notif.type === 'stock_out' ? 'critical' : 'medium';
 
-            for (const userId of allUserIds) {
-                // Deduplication Logic:
-                // 1. Check if there's an UNREAD notification for this specific item
-                // 2. OR check if any notification (even read) was created TODAY
-                const { data: existing } = await supabaseAdmin
-                    .from('notifications')
-                    .select('id, is_read')
-                    .eq('user_id', userId)
-                    .eq('store_id', storeId)
-                    .eq('type', notif.type)
-                    .contains('payload', { [notif.payload.batch_id ? 'batch_id' : 'product_id']: refId })
-                    .or(`is_read.eq.false,created_at.gte.${startOfDay.toISOString()}`)
-                    .limit(1);
-
-                if (!existing || existing.length === 0) {
-                    await supabaseAdmin.from('notifications').insert([{
-                        type: notif.type,
-                        title: notif.title,
-                        message: notif.message,
-                        category: notif.category,
-                        payload: notif.payload,
-                        store_id: storeId,
-                        user_id: userId,
-                        is_read: false
-                    }]);
-                    created++;
-                }
-            }
+            const isNew = await upsertNotificationGlobal(
+                storeId,
+                notif.type,
+                notif.title,
+                notif.message,
+                notif.category,
+                priority,
+                refId,
+                refType,
+                notif.payload
+            );
+            if (isNew) created++;
         }
 
         res.json({
@@ -827,6 +924,7 @@ app.post('/api/stock/check-notifications', async (req, res) => {
 // ==================== END STOCK ENDPOINTS ====================
 
 app.use('/api/branches', branchesRoutes);
+app.use('/api/ai', aiRoutes);
 
 // Customer search for autocomplete
 app.get('/api/customers/search', async (req, res) => {
@@ -1038,6 +1136,17 @@ app.post('/api/credit-payments', creditPaymentValidators, async (req, res) => {
             remainingPayment -= toPay;
         }
 
+        // AUTO-RESOLVE: Check if customer is now debt-free
+        const { count: remainingDebtCount } = await supabaseAdmin
+            .from('credit_accounts')
+            .select('id', { count: 'exact', head: true })
+            .eq('customer_id', customer_id)
+            .in('status', ['unpaid', 'partial', 'overdue']);
+
+        if (remainingDebtCount === 0) {
+            await deleteNotificationGlobal(storeId, ['payment_overdue', 'payment_due_soon'], customer_id, 'customer');
+        }
+
         res.json({ success: true, data: payments });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -1205,54 +1314,26 @@ app.post('/api/check-due-notifications', async (req, res) => {
     }
 });
 
-// ============================================================
-// 🔔 DAILY NOTIFICATION CHECK (Call from external cron daily)
-// Checks: Expiry, Near-Expiry, Payment Due, Promo Ending
-// ============================================================
-app.post('/api/notifications/daily-check', async (req, res) => {
+// ==================== AUTOMATED NOTIFICATION SCHEDULER ====================
+
+// Reusable function to process notifications for a SPECIFIC store
+const processStoreNotifications = async (storeId) => {
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0];
+    const in3Days = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const in7Days = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const in2Days = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const results = {
+        expired: 0,
+        nearExpiry: 0,
+        paymentOverdue: 0,
+        paymentDueSoon: 0,
+        promoEnding: 0,
+        cleaned: 0
+    };
+
     try {
-        const storeId = req.headers['x-store-id'];
-
-        if (!storeId) {
-            return res.status(400).json({ success: false, error: 'x-store-id header required' });
-        }
-
-        const today = new Date();
-        const todayStr = today.toISOString().split('T')[0];
-        const in3Days = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-        const in7Days = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-        const in2Days = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-
-        const results = {
-            expired: 0,
-            nearExpiry: 0,
-            paymentOverdue: 0,
-            paymentDueSoon: 0,
-            promoEnding: 0,
-            cleaned: 0
-        };
-
-        // Helper to call the database function
-        const createNotification = async (type, title, message, category, priority, referenceId, referenceType, payload) => {
-            try {
-                await supabaseAdmin.rpc('create_notification_for_store', {
-                    p_store_id: storeId,
-                    p_type: type,
-                    p_title: title,
-                    p_message: message,
-                    p_category: category,
-                    p_priority: priority,
-                    p_reference_id: referenceId,
-                    p_reference_type: referenceType,
-                    p_payload: payload
-                });
-                return true;
-            } catch (e) {
-                // Duplicate or other error, skip
-                return false;
-            }
-        };
-
         // 1. Check EXPIRED batches
         const { data: expiredBatches } = await supabaseAdmin
             .from('product_batches')
@@ -1268,13 +1349,14 @@ app.post('/api/notifications/daily-check', async (req, res) => {
                     daysExpired < 30 ? `${Math.ceil(daysExpired / 7)} สัปดาห์ที่แล้ว` :
                         `${Math.ceil(daysExpired / 30)} เดือนที่แล้ว`;
 
-            const created = await createNotification(
+            const isNew = await upsertNotificationGlobal(
+                storeId,
                 'stock_expired', 'สินค้าหมดอายุ',
                 `${batch.products.name} (Lot #${batch.batch_no?.replace('LOT-', '') || batch.id.slice(0, 8)})\nหมดอายุ${expiredText} • ${batch.remaining_qty} ชิ้น`,
                 'stock', 'critical', batch.id, 'batch',
                 { batch_id: batch.id, product_id: batch.products.id, expire_date: batch.expire_date }
             );
-            if (created) results.expired++;
+            if (isNew) results.expired++;
         }
 
         // 2. Check NEAR-EXPIRY batches (within 7 days)
@@ -1292,58 +1374,98 @@ app.post('/api/notifications/daily-check', async (req, res) => {
                 daysLeft === 1 ? 'หมดอายุพรุ่งนี้' :
                     `หมดอายุใน ${daysLeft} วัน`;
 
-            const created = await createNotification(
+            const isNew = await upsertNotificationGlobal(
+                storeId,
                 'stock_near_expiry', 'สินค้าใกล้หมดอายุ',
                 `${batch.products.name}\n${expiryText} • เหลือ ${batch.remaining_qty} ชิ้น`,
                 'stock', daysLeft <= 2 ? 'high' : 'medium', batch.id, 'batch',
                 { batch_id: batch.id, product_id: batch.products.id, expire_date: batch.expire_date, days_left: daysLeft }
             );
-            if (created) results.nearExpiry++;
+            if (isNew) results.nearExpiry++;
         }
 
-        // 3. Check OVERDUE payments
-        const { data: overdueAccounts } = await supabaseAdmin
+        // 3. Check Payments (Grouped by Customer, using LATEST due date)
+        const { data: allDebts } = await supabaseAdmin
             .from('credit_accounts')
-            .select('id, customer_id, remaining_amount, due_date, customers_info!inner(name, phone, store_id)')
+            .select('id, customer_id, remaining_amount, due_date, customers_info!inner(id, name, phone, store_id)')
             .eq('customers_info.store_id', storeId)
-            .lt('due_date', todayStr)
             .gt('remaining_amount', 0)
             .in('status', ['unpaid', 'partial', 'overdue']);
 
-        for (const acc of overdueAccounts || []) {
-            const daysOverdue = Math.ceil((today - new Date(acc.due_date)) / (1000 * 60 * 60 * 24));
-            const created = await createNotification(
-                'payment_overdue', 'ลูกหนี้เกินกำหนดชำระ',
-                `${acc.customers_info.name}\nค้างชำระ ฿${Number(acc.remaining_amount).toLocaleString()} • เกิน ${daysOverdue} วัน`,
-                'payment', 'critical', acc.customer_id, 'customer',
-                { customer_id: acc.customer_id, credit_account_id: acc.id, amount: acc.remaining_amount, days_overdue: daysOverdue }
-            );
-            if (created) results.paymentOverdue++;
+        // Grouping logic
+        const customerGroup = {};
+        for (const acc of allDebts || []) {
+            const cid = acc.customer_id;
+            if (!customerGroup[cid]) {
+                customerGroup[cid] = {
+                    customer_id: cid,
+                    name: acc.customers_info.name,
+                    phone: acc.customers_info.phone,
+                    total_amount: 0,
+                    latest_due: acc.due_date,
+                    bill_ids: []
+                };
+            }
+            customerGroup[cid].total_amount += Number(acc.remaining_amount);
+            customerGroup[cid].bill_ids.push(acc.id);
+
+            // Keep the LATEST due date
+            if (new Date(acc.due_date) > new Date(customerGroup[cid].latest_due)) {
+                customerGroup[cid].latest_due = acc.due_date;
+            }
         }
 
-        // 4. Check payments DUE SOON (within 3 days)
-        const { data: dueSoonAccounts } = await supabaseAdmin
-            .from('credit_accounts')
-            .select('id, customer_id, remaining_amount, due_date, customers_info!inner(name, phone, store_id)')
-            .eq('customers_info.store_id', storeId)
-            .gte('due_date', todayStr)
-            .lte('due_date', in3Days)
-            .gt('remaining_amount', 0)
-            .in('status', ['unpaid', 'partial']);
+        for (const cid in customerGroup) {
+            const data = customerGroup[cid];
+            const dueDate = new Date(data.latest_due);
+            const todayMidnight = new Date(todayStr).getTime();
+            const dueMidnight = new Date(dueDate.toISOString().split('T')[0]).getTime();
 
-        for (const acc of dueSoonAccounts || []) {
-            const daysLeft = Math.ceil((new Date(acc.due_date) - today) / (1000 * 60 * 60 * 24));
-            let dueText = daysLeft === 0 ? 'ครบกำหนดวันนี้' :
-                daysLeft === 1 ? 'ครบกำหนดพรุ่งนี้' :
-                    `ครบกำหนดใน ${daysLeft} วัน`;
+            const diffTime = dueMidnight - todayMidnight;
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
-            const created = await createNotification(
-                'payment_due_soon', 'ใกล้ครบกำหนดชำระ',
-                `${acc.customers_info.name}\nค้างชำระ ฿${Number(acc.remaining_amount).toLocaleString()} • ${dueText}`,
-                'payment', daysLeft === 0 ? 'high' : 'medium', acc.customer_id, 'customer',
-                { customer_id: acc.customer_id, credit_account_id: acc.id, amount: acc.remaining_amount, days_left: daysLeft }
-            );
-            if (created) results.paymentDueSoon++;
+            // Only notify if within range (Overdue OR Due within 3 days)
+            if (diffDays <= 3) {
+                let type = '';
+                let title = '';
+                let message = '';
+                let priority = 'medium';
+
+                if (diffDays < 0) {
+                    const daysOverdue = Math.abs(diffDays);
+                    type = 'payment_overdue';
+                    title = 'ลูกหนี้เกินกำหนดชำระ';
+                    message = `${data.name}\nยอดรวม ฿${data.total_amount.toLocaleString()} • เกินกำหนด ${daysOverdue} วัน`;
+                    priority = 'critical';
+                } else if (diffDays === 0) {
+                    type = 'payment_due_soon';
+                    title = 'ครบกำหนดชำระวันนี้';
+                    message = `${data.name}\nยอดรวม ฿${data.total_amount.toLocaleString()} • ครบกำหนดวันนี้`;
+                    priority = 'high';
+                } else {
+                    type = 'payment_due_soon';
+                    title = 'ใกล้ครบกำหนดชำระ';
+                    message = `${data.name}\nยอดรวม ฿${data.total_amount.toLocaleString()} • อีก ${diffDays} วันครบกำหนด`;
+                    priority = 'medium';
+                }
+
+                const payload = {
+                    customer_id: data.customer_id,
+                    phone: data.phone,
+                    amount: data.total_amount,
+                    latest_due: data.latest_due,
+                    days_diff: diffDays
+                };
+
+                // Use the new global helper
+                const isNew = await upsertNotificationGlobal(
+                    storeId, type, title, message, 'payment', priority, data.customer_id, 'customer', payload
+                );
+                if (isNew) {
+                    if (type === 'payment_overdue') results.paymentOverdue++;
+                    if (type === 'payment_due_soon') results.paymentDueSoon++;
+                }
+            }
         }
 
         // 5. Check PROMO ENDING (within 2 days)
@@ -1360,30 +1482,136 @@ app.post('/api/notifications/daily-check', async (req, res) => {
                 daysLeft === 1 ? 'หมดอายุพรุ่งนี้' :
                     `หมดอายุใน ${daysLeft} วัน`;
 
-            const created = await createNotification(
+            const isNew = await upsertNotificationGlobal(
+                storeId,
                 'promo_ending', 'โปรโมชั่นใกล้หมดอายุ',
                 `${promo.name}\n${endText}`,
                 'stock', 'medium', promo.id, 'promotion',
                 { promotion_id: promo.id, end_date: promo.end_date, days_left: daysLeft }
             );
-            if (created) results.promoEnding++;
+            if (isNew) results.promoEnding++;
         }
 
-        // 6. Cleanup old notifications (> 30 days)
-        const { count: cleanedCount } = await supabaseAdmin
+        // 6. AUTO-RESOLVE: Cleanup notifications for issues that are fixed
+        // Get all active alerts for this store
+        const { data: activeNotifs } = await supabaseAdmin
+            .from('notifications')
+            .select('id, type, reference_id')
+            .eq('store_id', storeId)
+            .in('type', ['stock_expired', 'stock_near_expiry', 'payment_overdue', 'payment_due_soon', 'stock_low', 'stock_out']);
+
+        const activeBatchIds = new Set([
+            ...(expiredBatches || []).map(b => b.id),
+            ...(nearExpiryBatches || []).map(b => b.id)
+        ]);
+        const activeCustomerIds = new Set(Object.keys(customerGroup));
+
+        // For stock_low and stock_out, we need to check current stock levels
+        const { data: currentProducts } = await supabaseAdmin
+            .from('products')
+            .select('id, stock_qty, low_stock_threshold')
+            .eq('store_id', storeId);
+
+        const problematicProductIds = new Set();
+        (currentProducts || []).forEach(p => {
+            const qty = parseFloat(p.stock_qty);
+            const threshold = parseFloat(p.low_stock_threshold);
+            if (qty === 0 || (threshold > 0 && qty <= threshold)) {
+                problematicProductIds.add(p.id);
+            }
+        });
+
+        const idsToDelete = [];
+
+        for (const notif of activeNotifs || []) {
+            let isResolved = false;
+
+            if (notif.type === 'stock_expired' || notif.type === 'stock_near_expiry') {
+                if (!activeBatchIds.has(notif.reference_id)) isResolved = true;
+            } else if (notif.type === 'payment_overdue' || notif.type === 'payment_due_soon') {
+                if (!activeCustomerIds.has(notif.reference_id)) isResolved = true;
+            } else if (notif.type === 'stock_low' || notif.type === 'stock_out') {
+                if (!problematicProductIds.has(notif.reference_id)) isResolved = true;
+            }
+
+            if (isResolved) {
+                idsToDelete.push(notif.id);
+            }
+        }
+
+        if (idsToDelete.length > 0) {
+            await supabaseAdmin
+                .from('notifications')
+                .delete()
+                .in('id', idsToDelete);
+            results.cleaned += idsToDelete.length;
+        }
+
+        // 7. Cleanup old notifications (> 30 days) (Existing logic)
+        const { count: expiredCleaned } = await supabaseAdmin
             .from('notifications')
             .delete({ count: 'exact' })
             .lt('expires_at', today.toISOString());
 
-        results.cleaned = cleanedCount || 0;
+        results.cleaned += (expiredCleaned || 0);
+
+        return results;
+
+    } catch (error) {
+        console.error(`Error processing store ${storeId}:`, error);
+        return results;
+    }
+};
+
+// Scheduler Function
+const startAutoScheduler = () => {
+    console.log("Starting Auto-Notification Scheduler...");
+
+    const runChecks = async () => {
+        console.log(`[${new Date().toISOString()}] Running automated checks...`);
+        try {
+            // Get all active stores
+            const { data: stores } = await supabaseAdmin
+                .from('stores')
+                .select('id')
+                .eq('is_active', true);
+
+            for (const store of stores || []) {
+                await processStoreNotifications(store.id);
+            }
+        } catch (error) {
+            console.error("Scheduler Error:", error);
+        }
+    };
+
+    // Run immediately on start
+    runChecks();
+
+    // Then run every 24 hours (86400000 ms) - Daily Safety Net
+    setInterval(runChecks, 86400000);
+};
+
+// Start the scheduler
+startAutoScheduler();
+
+// ========================================================================
+
+// 🔔 DAILY NOTIFICATION CHECK (Manual Trigger via API)
+app.post('/api/notifications/daily-check', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        if (!storeId) {
+            return res.status(400).json({ success: false, error: 'x-store-id header required' });
+        }
+
+        const results = await processStoreNotifications(storeId);
 
         res.json({
             success: true,
-            message: 'Daily check completed',
+            message: 'Manual check completed',
             results
         });
     } catch (error) {
-        console.error('Daily Check Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -1522,6 +1750,10 @@ app.post('/api/sales', async (req, res) => {
 
         // 1. Create Order
         const orderNo = `ORD-${Date.now().toString().slice(-8)}`; // Simple Order No
+
+        // Use client-provided timestamp if available (for offline sync), otherwise use now
+        const orderDate = req.body.client_created_at || new Date().toISOString();
+
         const { data: order, error: orderError } = await supabaseAdmin
             .from('orders')
             .insert([{
@@ -1529,9 +1761,11 @@ app.post('/api/sales', async (req, res) => {
                 customer_id: customerId || null,
                 total_amount: totalAmount,
                 payment_status: paymentMethod === 'credit' ? 'pending' : 'paid',
-                payment_type: paymentMethod === 'credit' ? 'credit_sale' : 'cash_sale', // Distinguish credit vs cash/qr
+                payment_type: paymentMethod === 'credit' ? 'credit_sale' : 'cash_sale',
                 store_id: storeId,
-                client_created_at: new Date().toISOString()
+                created_at: orderDate, // Override created_at with actual sale time
+                client_created_at: orderDate, // Keep track of client time explicitly
+                synced: true // Mark as synced since it reached the server
             }])
             .select()
             .single();
@@ -1626,13 +1860,48 @@ app.post('/api/sales', async (req, res) => {
                 }
             }
 
-            // 2.3 Update Main Product Stock
-            const { data: product } = await supabaseAdmin.from('products').select('stock_qty').eq('id', productId).single();
+            // 2.3 Update Main Product Stock & Check for Notifications
+            const { data: product } = await supabaseAdmin
+                .from('products')
+                .select('stock_qty, low_stock_threshold, name')
+                .eq('id', productId)
+                .single();
+
             const currentStock = parseFloat(product?.stock_qty || 0);
+            const threshold = parseFloat(product?.low_stock_threshold || 0);
+            const newStock = currentStock - qtyToDeduct;
+
             await supabaseAdmin
                 .from('products')
-                .update({ stock_qty: currentStock - qtyToDeduct })
+                .update({ stock_qty: newStock })
                 .eq('id', productId);
+
+            // REALTIME STOCK CHECK (Event-Driven)
+            if (newStock <= 0) {
+                await upsertNotificationGlobal(
+                    storeId,
+                    'stock_out',
+                    'สินค้าหมด',
+                    product.name,
+                    'stock',
+                    'high', // Priority
+                    productId,
+                    'product',
+                    { product_id: productId }
+                );
+            } else if (threshold > 0 && newStock <= threshold) {
+                await upsertNotificationGlobal(
+                    storeId,
+                    'stock_low',
+                    'สินค้าใกล้หมด',
+                    `${product.name}\nเหลือ ${newStock} ชิ้น`,
+                    'stock',
+                    'medium', // Priority
+                    productId,
+                    'product',
+                    { product_id: productId, stock_qty: newStock, threshold: threshold }
+                );
+            }
         }
 
         // 3. Record Payment (if not credit sale or if partial/full payment made)
@@ -1976,6 +2245,64 @@ app.get('/api/products', async (req, res) => {
 
         if (error) throw error;
 
+        // --- Attach Active Promotions ---
+        if (data && data.length > 0) {
+            const productIds = data.map(p => p.id);
+            const today = new Date().toISOString().split('T')[0];
+
+            const { data: promos, error: promoError } = await supabaseAdmin
+                .from('promotion_items')
+                .select(`
+                    product_id,
+                    promotions!inner (
+                        id, name, type, discount_value, 
+                        min_qty_required, free_qty, 
+                        start_date, end_date
+                    )
+                `)
+                .in('product_id', productIds)
+                .eq('promotions.is_active', true)
+                .lte('promotions.start_date', today)
+                .gte('promotions.end_date', today);
+
+            if (!promoError && promos) {
+                // Map promotions to products
+                const promoMap = {};
+                promos.forEach(item => {
+                    promoMap[item.product_id] = item.promotions;
+                });
+
+                data.forEach(p => {
+                    const promo = promoMap[p.id];
+                    if (promo) {
+                        p.original_price = p.price;
+                        p.is_promotion = true;
+                        p.promotion = {
+                            id: promo.id,
+                            name: promo.name,
+                            type: promo.type,
+                            discount_value: promo.discount_value,
+                            min_qty: promo.min_qty_required,
+                            free_qty: promo.free_qty
+                        };
+
+                        if (promo.type === 'discount_percent') {
+                            const discountPercent = parseFloat(promo.discount_value);
+                            p.discount_percent = discountPercent;
+                            p.price = Math.round(p.price * (1 - discountPercent / 100));
+                        } else if (promo.type === 'buy_x_get_y') {
+                            // Price stays same, logic handled in cart
+                        }
+                    } else {
+                        p.is_promotion = false;
+                        p.discount_percent = 0;
+                        p.original_price = p.price;
+                    }
+                });
+            }
+        }
+        // --------------------------------
+
         res.json({ success: true, data, page, limit });
     } catch (error) {
         console.error('Get products error:', error);
@@ -2022,10 +2349,60 @@ app.get('/api/products/barcode/:barcode', async (req, res) => {
             .eq('product_id', data.id)
             .order('expire_date', { ascending: true });
 
+        // Check for active promotion (Detailed)
+        let promotion = null;
+        let finalPrice = data.price;
+        let discountPercent = 0;
+
+        const today = new Date().toISOString().split('T')[0];
+
+        const { data: promoItems, error: promoError } = await supabaseAdmin
+            .from('promotion_items')
+            .select(`
+                promotions!inner (
+                    id, name, type, discount_value, 
+                    min_qty_required, free_qty, 
+                    start_date, end_date
+                )
+            `)
+            .eq('product_id', data.id)
+            .eq('promotions.is_active', true)
+            .lte('promotions.start_date', today)
+            .gte('promotions.end_date', today)
+            .limit(1);
+
+        if (!promoError && promoItems && promoItems.length > 0) {
+            const p = promoItems[0].promotions;
+
+            if (p.type === 'discount_percent') {
+                discountPercent = parseFloat(p.discount_value);
+                finalPrice = Math.round(data.price * (1 - discountPercent / 100));
+            } else if (p.type === 'buy_x_get_y') {
+                // For B1G1, unit price is same, logic handles in cart
+            }
+
+            promotion = {
+                id: p.id,
+                name: p.name,
+                type: p.type,
+                discount_value: p.discount_value,
+                min_qty: p.min_qty_required,
+                free_qty: p.free_qty
+            };
+        }
+
         res.json({
             success: true,
             exists: true,
-            data: { ...data, batches: batches || [] }
+            data: {
+                ...data,
+                batches: batches || [],
+                price: finalPrice, // Discounted price if percentage
+                original_price: data.price,
+                discount_percent: discountPercent,
+                is_promotion: !!promotion,
+                promotion: promotion // Full promotion object
+            }
         });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -2037,6 +2414,7 @@ app.post('/api/products/:id/add-batch', async (req, res) => {
     try {
         const { id } = req.params;
         const { quantity, costPrice, salePrice, expireDate } = req.body;
+        const storeId = req.headers['x-store-id']; // Needed for notification cleanup
         const qty = parseFloat(quantity) || 0;
         const cost = parseFloat(costPrice) || 0;
         const sale = parseFloat(salePrice) || 0;
@@ -2064,7 +2442,7 @@ app.post('/api/products/:id/add-batch', async (req, res) => {
         // 2. Update product stock_qty (accumulate) and optionally update prices
         const { data: product, error: productError } = await supabaseAdmin
             .from('products')
-            .select('stock_qty, cost_price, price')
+            .select('stock_qty, cost_price, price, low_stock_threshold')
             .eq('id', id)
             .single();
 
@@ -2087,6 +2465,12 @@ app.post('/api/products/:id/add-batch', async (req, res) => {
             .from('products')
             .update(updateData)
             .eq('id', id);
+
+        // AUTO-RESOLVE: Stock added -> Clear "Stock Out" and "Low Stock" alerts
+        // If stock is now healthy (or user just wants to clear alerts by restocking)
+        if (storeId) {
+            await deleteNotificationGlobal(storeId, ['stock_out', 'stock_low'], id, 'product');
+        }
 
         res.json({
             success: true,
