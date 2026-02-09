@@ -157,7 +157,23 @@ async function signUrlIfNeeded(urlOrPath, bucket) {
 const convertDateFormat = (dateInput) => {
     if (!dateInput) return null;
     try {
-        const d = new Date(dateInput);
+        let d;
+
+        // Check if input is in DD/MM/YYYY format (from frontend)
+        if (typeof dateInput === 'string' && dateInput.includes('/')) {
+            const parts = dateInput.split('/');
+            if (parts.length === 3) {
+                const day = parseInt(parts[0], 10);
+                const month = parseInt(parts[1], 10) - 1; // Month is 0-indexed
+                const year = parseInt(parts[2], 10);
+                d = new Date(year, month, day);
+            } else {
+                d = new Date(dateInput);
+            }
+        } else {
+            d = new Date(dateInput);
+        }
+
         if (isNaN(d.getTime())) return null; // Invalid date
         const year = d.getFullYear();
         const month = String(d.getMonth() + 1).padStart(2, '0');
@@ -923,7 +939,7 @@ app.post('/api/stock/check-notifications', async (req, res) => {
 
 // ==================== END STOCK ENDPOINTS ====================
 
-app.use('/api/branches', branchesRoutes);
+app.use('/api/branches', authMiddleware, branchesRoutes);
 app.use('/api/ai', aiRoutes);
 
 // Customer search for autocomplete
@@ -938,7 +954,7 @@ app.get('/api/customers/search', async (req, res) => {
 
         let query = supabaseAdmin
             .from('customers_info')
-            .select('id, name, phone, image_url')
+            .select('id, name, phone, image_url, due_date')
             .or(`name.ilike.%${q}%,phone.ilike.%${q}%`)
             .limit(5);
 
@@ -973,9 +989,9 @@ app.get('/api/customers/with-debt', async (req, res) => {
 
         let query = supabaseAdmin
             .from('credit_accounts')
-            .select('*, customers_info!inner(id, name, phone, image_url), orders(order_no)')
-            .in('status', ['unpaid', 'partial', 'overdue'])
-            .order('due_date', { ascending: true });
+            .select('*, customers_info!inner(id, name, phone, image_url, due_date), orders(order_no)')
+            .in('status', ['unpaid', 'partial', 'overdue']);
+        // .order('due_date', { ascending: true }); // Removed: Sort by customer due_date below
 
         // Filter by store_id if provided
         if (storeId) {
@@ -998,6 +1014,7 @@ app.get('/api/customers/with-debt', async (req, res) => {
                     name: account.customers_info?.name,
                     phone: account.customers_info?.phone,
                     image_url: await signUrlIfNeeded(account.customers_info?.image_url, 'customers'),
+                    due_date: account.customers_info?.due_date, // NEW
                     total_debt: 0,
                     accounts: []
                 };
@@ -1006,7 +1023,12 @@ app.get('/api/customers/with-debt', async (req, res) => {
             customerMap[customerId].accounts.push(account);
         }
 
-        const customers = Object.values(customerMap);
+        const customers = Object.values(customerMap).sort((a, b) => {
+            // Sort customers by due_date ASC
+            if (!a.due_date) return 1;
+            if (!b.due_date) return -1;
+            return new Date(a.due_date) - new Date(b.due_date);
+        });
         res.json({ success: true, data: customers });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -1034,7 +1056,7 @@ app.get('/api/customers/:id/pending-bills', async (req, res) => {
             .eq('customer_id', id)
             .eq('customers_info.store_id', storeId)
             .in('status', ['unpaid', 'partial', 'overdue'])
-            .order('due_date', { ascending: true });
+            .order('created_at', { ascending: true }); // Changed from due_date
         if (error) throw error;
 
         res.json({ success: true, data });
@@ -1058,14 +1080,14 @@ app.post('/api/credit-payments', creditPaymentValidators, async (req, res) => {
 
         let remainingPayment = parseFloat(amount);
 
-        // Fetch all unpaid/partial bills for this customer, ordered by due_date ASC (oldest first)
+        // Fetch all unpaid/partial bills for this customer, ordered by created_at ASC (oldest first)
         const { data: accounts, error: fetchError } = await supabaseAdmin
             .from('credit_accounts')
             .select('*, customers_info!inner(store_id)')
             .eq('customer_id', customer_id)
             .eq('customers_info.store_id', storeId)
             .in('status', ['unpaid', 'partial', 'overdue'])
-            .order('due_date', { ascending: true }); // Pay oldest first
+            .order('created_at', { ascending: true }); // Changed from due_date
 
         if (fetchError) throw fetchError;
 
@@ -1233,9 +1255,10 @@ app.post('/api/check-due-notifications', async (req, res) => {
         const allUserIds = [store.owner_id, ...members.map(m => m.user_id)];
 
         // 2. Get unpaid/partial debts for this store
+        // 2. Get unpaid/partial debts for this store
         const { data: accounts } = await supabaseAdmin
             .from('credit_accounts')
-            .select('*, customers_info!inner(name, phone, store_id)')
+            .select('*, customers_info!inner(name, phone, store_id, due_date)') // Add due_date
             .in('status', ['unpaid', 'partial'])
             .eq('customers_info.store_id', storeId); // Filter by store
 
@@ -1243,7 +1266,7 @@ app.post('/api/check-due-notifications', async (req, res) => {
             return res.json({ success: true, created: 0 });
         }
 
-        // 3. Group by customer and find latest due date
+        // 3. Group by customer and find due date (from customer info)
         const customerDebts = {};
         for (const account of accounts) {
             const customerId = account.customer_id;
@@ -1252,11 +1275,10 @@ app.post('/api/check-due-notifications', async (req, res) => {
                     name: account.customers_info.name,
                     phone: account.customers_info.phone,
                     total_debt: 0,
-                    dates: []
+                    due_date: account.customers_info.due_date // Use customer due date
                 };
             }
             customerDebts[customerId].total_debt += parseFloat(account.remaining_amount);
-            customerDebts[customerId].dates.push(new Date(account.due_date));
         }
 
         const today = new Date();
@@ -1266,7 +1288,9 @@ app.post('/api/check-due-notifications', async (req, res) => {
         // 4. Check each customer status
         for (const customerId in customerDebts) {
             const data = customerDebts[customerId];
-            const maxDueDate = new Date(Math.max.apply(null, data.dates));
+            if (!data.due_date) continue; // Skip if no due date set
+
+            const maxDueDate = new Date(data.due_date);
             const diffDays = Math.ceil((maxDueDate - today) / (1000 * 60 * 60 * 24));
 
             // Logic: Overdue (< 0) or Near Due (<= 3)
@@ -1387,7 +1411,7 @@ const processStoreNotifications = async (storeId) => {
         // 3. Check Payments (Grouped by Customer, using LATEST due date)
         const { data: allDebts } = await supabaseAdmin
             .from('credit_accounts')
-            .select('id, customer_id, remaining_amount, due_date, customers_info!inner(id, name, phone, store_id)')
+            .select('id, customer_id, remaining_amount, customers_info!inner(id, name, phone, store_id, due_date)')
             .eq('customers_info.store_id', storeId)
             .gt('remaining_amount', 0)
             .in('status', ['unpaid', 'partial', 'overdue']);
@@ -1402,17 +1426,12 @@ const processStoreNotifications = async (storeId) => {
                     name: acc.customers_info.name,
                     phone: acc.customers_info.phone,
                     total_amount: 0,
-                    latest_due: acc.due_date,
+                    latest_due: acc.customers_info.due_date, // Use Customer's Due Date
                     bill_ids: []
                 };
             }
             customerGroup[cid].total_amount += Number(acc.remaining_amount);
             customerGroup[cid].bill_ids.push(acc.id);
-
-            // Keep the LATEST due date
-            if (new Date(acc.due_date) > new Date(customerGroup[cid].latest_due)) {
-                customerGroup[cid].latest_due = acc.due_date;
-            }
         }
 
         for (const cid in customerGroup) {
@@ -2155,6 +2174,19 @@ app.post('/api/credit-sales', async (req, res) => {
         }
         // -----------------------------------------------------------
 
+        // NEW: Update Customer's Global Due Date
+        if (due_date) {
+            const { error: updateDueError } = await supabaseAdmin
+                .from('customers_info')
+                .update({ due_date: convertDateFormat(due_date) })
+                .eq('id', customer.id);
+
+            if (updateDueError) {
+                console.error('Failed to update customer due_date:', updateDueError);
+                // Continue despite error, as sale is more important
+            }
+        }
+
         const { data: creditAccount, error: creditError } = await supabaseAdmin
             .from('credit_accounts')
             .insert([{
@@ -2163,7 +2195,7 @@ app.post('/api/credit-sales', async (req, res) => {
                 total_debt: amount,
                 paid_amount: 0,
                 remaining_amount: amount,
-                due_date: convertDateFormat(due_date),
+                // due_date: convertDateFormat(due_date), // REMOVED per user request
                 status: 'unpaid'
             }])
             .select()

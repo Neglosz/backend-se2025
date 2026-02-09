@@ -124,7 +124,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     // C. Debt with Customer Names
     const { data: debts } = await supabaseAdmin
         .from('credit_accounts')
-        .select('remaining_amount, due_date, customers_info!inner(store_id, name, phone)')
+        .select('remaining_amount, customers_info!inner(store_id, name, phone, due_date)')
         .eq('customers_info.store_id', storeId)
         .gt('remaining_amount', 0)
         .order('remaining_amount', { ascending: false });
@@ -134,7 +134,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
         const name = d.customers_info?.name || 'ไม่ระบุชื่อ';
         const phone = d.customers_info?.phone || null;
         const amount = parseFloat(d.remaining_amount) || 0;
-        const dueDate = d.due_date ? new Date(d.due_date) : null;
+        const dueDate = d.customers_info?.due_date ? new Date(d.customers_info.due_date) : null; // Use customer due date
         const today = new Date();
         let status = '';
         if (dueDate) {

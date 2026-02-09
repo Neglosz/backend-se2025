@@ -150,4 +150,106 @@ router.post('/reset-credentials', async (req, res) => {
     }
 });
 
+// DELETE /api/branches/delete
+// Delete a store and all related data (owner only)
+router.delete('/delete', async (req, res) => {
+    const { store_id } = req.body;
+    const owner_id = req.user.id;
+
+    try {
+        // Verify the store belongs to the owner
+        const { data: store, error: storeError } = await supabaseAdmin
+            .from('stores')
+            .select('id, owner_id, name')
+            .eq('id', store_id)
+            .single();
+
+        if (storeError || !store) {
+            return res.status(404).json({ error: 'Store not found' });
+        }
+
+        if (store.owner_id !== owner_id) {
+            return res.status(403).json({ error: 'Not authorized - only owner can delete' });
+        }
+
+        // 1. Get all manager accounts for this store
+        const { data: members } = await supabaseAdmin
+            .from('store_members')
+            .select('user_id')
+            .eq('store_id', store_id);
+
+        // 2. Delete manager user accounts
+        if (members && members.length > 0) {
+            for (const member of members) {
+                try {
+                    await supabaseAdmin.auth.admin.deleteUser(member.user_id);
+                } catch (e) {
+                    console.log('Could not delete user:', member.user_id, e.message);
+                }
+            }
+        }
+
+        // 3. Delete store_members
+        await supabaseAdmin
+            .from('store_members')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 4. Delete store_credentials
+        await supabaseAdmin
+            .from('store_credentials')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 5. Delete store_settings
+        await supabaseAdmin
+            .from('store_settings')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 6. Delete products
+        await supabaseAdmin
+            .from('products')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 7. Delete order_items for orders in this store
+        const { data: orders } = await supabaseAdmin
+            .from('orders')
+            .select('id')
+            .eq('store_id', store_id);
+
+        if (orders && orders.length > 0) {
+            const orderIds = orders.map(o => o.id);
+            await supabaseAdmin
+                .from('order_items')
+                .delete()
+                .in('order_id', orderIds);
+        }
+
+        // 8. Delete orders
+        await supabaseAdmin
+            .from('orders')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 9. Finally, delete the store
+        const { error: deleteError } = await supabaseAdmin
+            .from('stores')
+            .delete()
+            .eq('id', store_id);
+
+        if (deleteError) throw deleteError;
+
+        res.json({
+            success: true,
+            message: `Store "${store.name}" deleted successfully`
+        });
+
+    } catch (error) {
+        console.error('Delete store error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 module.exports = router;
