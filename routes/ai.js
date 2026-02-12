@@ -7,7 +7,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
+const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
 
 // Admin client for backend operations
 const supabaseAdmin = createClient(
@@ -376,7 +376,7 @@ If the user asks something unrelated to the store, politely redirect them.
 
         // Initialize model per request to inject specific system instruction
         const chatModel = genAI.getGenerativeModel({
-            model: "gemini-2.0-flash-lite",
+            model: "gemini-3-flash-preview",
             systemInstruction: systemInstruction
         });
 

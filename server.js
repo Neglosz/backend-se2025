@@ -14,29 +14,14 @@ const aiRoutes = require('./routes/ai');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.set('trust proxy', 1); // Enable trust proxy for Render/Load Balancers
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(helmet());
 
-// Temporary Migration: Add tendered_amount to orders
 app.post('/api/admin/migrate-add-tendered', authMiddleware, async (req, res) => {
     try {
-        // We will try to use a "rpc" call if a 'exec_sql' function exists (common pattern)
-        // If not, we might be stuck. 
-        // BUT, looking at the previous turn, the user provided the schema.
-        // I will try to add it via a clever workaround or just assume I can't and use a JSON field if available?
-        // 'notifications' has payload. 'orders' doesn't have a json blob.
-        
-        // Let's try to just use the `pg` library pattern if I can require it?
-        // No, I must stick to available tools.
-        
-        // Let's use the 'run_shell_command' tool from the AGENT side to run the migration, NOT inside server.js.
-        // So this endpoint is actually not the best way.
-        
-        // I will abort adding this endpoint and do it via the Agent tool in the next step.
-        // For now, I will just add the logic to server.js assuming the column exists.
         res.json({ message: "Use the agent tool to migrate." });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -44,7 +29,6 @@ app.post('/api/admin/migrate-add-tendered', authMiddleware, async (req, res) => 
 });
 
 
-// DEBUG ENDPOINT: Check Store/Product Status (Safe, Read-Only)
 app.get('/api/debug/whoami', authMiddleware, async (req, res) => {
     try {
         const userId = req.user.id;
