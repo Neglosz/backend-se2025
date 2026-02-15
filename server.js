@@ -1769,9 +1769,20 @@ app.post('/api/sales', async (req, res) => {
         const orderItems = [];
 
         for (const item of items) {
-            let qtyToDeduct = parseFloat(item.quantity);
-            const productId = item.id;
-            const price = parseFloat(item.price);
+            // 1. Determine Unit & Conversion
+            // If unit_code is present (weighted item), use it to convert to base unit (kg) for stock
+            // If not (normal item), use 1:1
+            const unitCode = item.unit_code;
+            const unitLabel = item.unit || item.unit_type || 'ชิ้น'; // Fallback to 'ชิ้น'
+
+            let conversion = 1;
+            if (unitCode === 'g') conversion = 0.001;
+            else if (unitCode === 'h') conversion = 0.1;
+            // else default 1 (kg or pieces)
+
+            let qtyToDeduct = parseFloat(item.quantity) * conversion;
+            const productId = item.product_id || item.id; // product_id for weight items, id for normal
+            const price = parseFloat(item.price); // This is price per UNIT (e.g. per gram)
 
             // 2.1 Get Product Batches (FIFO: Expiring First)
             const { data: batches, error: batchFetchError } = await supabaseAdmin
@@ -1792,11 +1803,13 @@ app.post('/api/sales', async (req, res) => {
             if (!batches || batches.length === 0) {
                 // Case: No batches available (Stock might be 0 or just not tracked in batches)
                 // Just create one order item with null batch
-                const subtotal = qtyToDeduct * price;
+                // Qty recorded is the original item.quantity (e.g. 500 g)
+                const subtotal = item.quantity * price;
                 await supabaseAdmin.from('order_items').insert([{
                     order_id: order.id,
                     product_id: productId,
-                    qty: qtyToDeduct,
+                    qty: item.quantity, // Record 500
+                    unit: unitLabel,    // Record "กรัม"
                     price_per_unit: price,
                     subtotal: subtotal,
                     batch_id: null
@@ -1806,7 +1819,7 @@ app.post('/api/sales', async (req, res) => {
                     if (remainingToFulfill <= 0) break;
 
                     const availableInBatch = parseFloat(batch.remaining_qty);
-                    const deductAmount = Math.min(remainingToFulfill, availableInBatch);
+                    const deductAmount = Math.min(remainingToFulfill, availableInBatch); // In KG
 
                     // Update Batch
                     await supabaseAdmin
@@ -1819,18 +1832,22 @@ app.post('/api/sales', async (req, res) => {
                         product_id: productId,
                         batch_id: batch.id,
                         trans_type: 'out',
-                        qty: deductAmount,
+                        qty: deductAmount, // Store specific stock unit (kg)
                         reference_type: 'sale',
                         reference_id: order.id,
-                        notes: `Sale Order: ${orderNo}`
+                        notes: `Sale Order: ${orderNo} (${unitLabel})`
                     }]);
 
                     // Insert Order Item (Split by batch)
-                    const subtotal = deductAmount * price;
+                    // We need to convert deductAmount (KG) back to Item Unit (e.g. Grams) for the receipt/record
+                    const recordedQty = deductAmount / conversion;
+                    const subtotal = recordedQty * price;
+
                     await supabaseAdmin.from('order_items').insert([{
                         order_id: order.id,
                         product_id: productId,
-                        qty: deductAmount,
+                        qty: recordedQty,
+                        unit: unitLabel,
                         price_per_unit: price,
                         subtotal: subtotal,
                         batch_id: batch.id
@@ -1841,11 +1858,13 @@ app.post('/api/sales', async (req, res) => {
 
                 // If still remaining (more sold than in batches), record the rest as null batch
                 if (remainingToFulfill > 0) {
-                    const subtotal = remainingToFulfill * price;
+                    const recordedQty = remainingToFulfill / conversion;
+                    const subtotal = recordedQty * price;
                     await supabaseAdmin.from('order_items').insert([{
                         order_id: order.id,
                         product_id: productId,
-                        qty: remainingToFulfill,
+                        qty: recordedQty,
+                        unit: unitLabel,
                         price_per_unit: price,
                         subtotal: subtotal,
                         batch_id: null
@@ -1900,7 +1919,7 @@ app.post('/api/sales', async (req, res) => {
         // 3. Record Payment (if not credit sale or if partial/full payment made)
         if (paymentMethod !== 'credit') {
             const changeAmount = (receivedAmount || totalAmount) - totalAmount;
-            
+
             const { error: paymentError } = await supabaseAdmin
                 .from('payments')
                 .insert([{
@@ -1909,7 +1928,7 @@ app.post('/api/sales', async (req, res) => {
                     amount: totalAmount,
                     paid_at: new Date().toISOString(),
                     // Use dedicated columns for better data integrity
-                    tendered_amount: receivedAmount || totalAmount, 
+                    tendered_amount: receivedAmount || totalAmount,
                     change_amount: changeAmount > 0 ? changeAmount : 0
                 }]);
 
@@ -2067,8 +2086,16 @@ app.post('/api/credit-sales', async (req, res) => {
         // --- Process Items & Deduct Stock (Copied from Normal Sale) ---
         if (items && items.length > 0) {
             for (const item of items) {
-                let qtyToDeduct = parseFloat(item.quantity);
-                const productId = item.id;
+                // 1. Determine Unit & Conversion (Same as Normal Sale)
+                const unitCode = item.unit_code;
+                const unitLabel = item.unit || item.unit_type || 'ชิ้น';
+
+                let conversion = 1;
+                if (unitCode === 'g') conversion = 0.001;
+                else if (unitCode === 'h') conversion = 0.1;
+
+                let qtyToDeduct = parseFloat(item.quantity) * conversion;
+                const productId = item.product_id || item.id;
                 const price = parseFloat(item.price);
 
                 // Get Product Batches (FIFO)
@@ -2082,11 +2109,12 @@ app.post('/api/credit-sales', async (req, res) => {
                 let remainingToFulfill = qtyToDeduct;
 
                 if (!batches || batches.length === 0) {
-                    const subtotal = qtyToDeduct * price;
+                    const subtotal = item.quantity * price;
                     await supabaseAdmin.from('order_items').insert([{
                         order_id: order.id,
                         product_id: productId,
-                        qty: qtyToDeduct,
+                        qty: item.quantity,
+                        unit: unitLabel,
                         price_per_unit: price,
                         subtotal: subtotal,
                         batch_id: null
@@ -2112,15 +2140,18 @@ app.post('/api/credit-sales', async (req, res) => {
                             qty: deductAmount,
                             reference_type: 'sale',
                             reference_id: order.id,
-                            notes: `Credit Sale: ${orderNo}`
+                            notes: `Credit Sale: ${orderNo} (${unitLabel})`
                         }]);
 
                         // Insert Order Item
-                        const subtotal = deductAmount * price;
+                        const recordedQty = deductAmount / conversion;
+                        const subtotal = recordedQty * price;
+
                         await supabaseAdmin.from('order_items').insert([{
                             order_id: order.id,
                             product_id: productId,
-                            qty: deductAmount,
+                            qty: recordedQty,
+                            unit: unitLabel,
                             price_per_unit: price,
                             subtotal: subtotal,
                             batch_id: batch.id
@@ -2130,11 +2161,14 @@ app.post('/api/credit-sales', async (req, res) => {
                     }
 
                     if (remainingToFulfill > 0) {
-                        const subtotal = remainingToFulfill * price;
+                        const recordedQty = remainingToFulfill / conversion;
+                        const subtotal = recordedQty * price;
+
                         await supabaseAdmin.from('order_items').insert([{
                             order_id: order.id,
                             product_id: productId,
-                            qty: remainingToFulfill,
+                            qty: recordedQty,
+                            unit: unitLabel,
                             price_per_unit: price,
                             subtotal: subtotal,
                             batch_id: null
@@ -3208,9 +3242,9 @@ app.get('/api/orders', async (req, res) => {
             } else if (status === 'unpaid') {
                 query = query.in('payment_status', ['pending', 'partial', 'cancelled']);
             }
-             else if (status === 'pending') {
+            else if (status === 'pending') {
                 query = query.eq('payment_status', 'pending');
-             }
+            }
         }
 
         // 3. Payment Method (Cash, QR, Credit)
@@ -3235,13 +3269,13 @@ app.get('/api/orders', async (req, res) => {
                     `, { count: 'exact' })
                     .eq('store_id', storeId)
                     .eq('payments.method', 'cash');
-                    
-                    // Re-apply date filters if needed (duplication, but necessary if query object reset)
-                    if (startDate) query = query.gte('created_at', startDate);
-                    if (endDate) query = query.lte('created_at', endDate);
-                    
+
+                // Re-apply date filters if needed (duplication, but necessary if query object reset)
+                if (startDate) query = query.gte('created_at', startDate);
+                if (endDate) query = query.lte('created_at', endDate);
+
             } else if (paymentMethod === 'qr') {
-                 query = supabaseAdmin
+                query = supabaseAdmin
                     .from('orders')
                     .select(`
                         id,
@@ -3256,8 +3290,8 @@ app.get('/api/orders', async (req, res) => {
                     .eq('store_id', storeId)
                     .eq('payments.method', 'qr_promptpay');
 
-                    if (startDate) query = query.gte('created_at', startDate);
-                    if (endDate) query = query.lte('created_at', endDate);
+                if (startDate) query = query.gte('created_at', startDate);
+                if (endDate) query = query.lte('created_at', endDate);
             }
         }
 
@@ -3344,7 +3378,7 @@ app.get('/api/orders/:id', async (req, res) => {
         let paymentMethodDisplay = 'เงินสด';
         let received = parseFloat(order.total_amount);
         let change = 0;
-        
+
         if (order.payment_type === 'credit_sale') {
             paymentMethodDisplay = 'เครดิต (ค้างจ่าย)';
             received = 0;
@@ -3357,7 +3391,7 @@ app.get('/api/orders/:id', async (req, res) => {
             } else {
                 paymentMethodDisplay = 'เงินสด';
             }
-            
+
             // Use dedicated columns if available
             if (p.tendered_amount !== null && p.tendered_amount !== undefined) {
                 received = parseFloat(p.tendered_amount);
