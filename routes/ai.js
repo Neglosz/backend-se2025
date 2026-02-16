@@ -129,12 +129,13 @@ const getStoreSummary = async (storeId, lat, lon) => {
         .gt('remaining_amount', 0)
         .order('remaining_amount', { ascending: false });
 
-    // Format debts for AI context
-    const debtList = debts?.map(d => {
+    // Format debts for AI context — group by customer name
+    const debtMap = {};
+    debts?.forEach(d => {
         const name = d.customers_info?.name || 'ไม่ระบุชื่อ';
         const phone = d.customers_info?.phone || null;
         const amount = parseFloat(d.remaining_amount) || 0;
-        const dueDate = d.customers_info?.due_date ? new Date(d.customers_info.due_date) : null; // Use customer due date
+        const dueDate = d.customers_info?.due_date ? new Date(d.customers_info.due_date) : null;
         const today = new Date();
         let status = '';
         if (dueDate) {
@@ -143,8 +144,16 @@ const getStoreSummary = async (storeId, lat, lon) => {
             else if (daysDiff === 0) status = 'ครบกำหนดวันนี้';
             else status = `อีก ${Math.abs(daysDiff)} วัน`;
         }
-        return { name, phone, amount, status };
-    }) || [];
+
+        if (debtMap[name]) {
+            debtMap[name].amount += amount;
+            // Keep the most urgent status
+            if (!debtMap[name].status && status) debtMap[name].status = status;
+        } else {
+            debtMap[name] = { name, phone, amount, status };
+        }
+    });
+    const debtList = Object.values(debtMap).sort((a, b) => b.amount - a.amount);
 
     // D. Store Info
     const { data: storeInfo } = await supabaseAdmin
@@ -359,19 +368,23 @@ router.post('/chat', async (req, res) => {
         const systemInstruction = `
 ${data.context}
 
-You are a helpful, professional Thai business partner for this store.
-Your goal is to provide actionable insights, not just raw numbers.
+คุณคือ "ผู้จัดการร้านมืออาชีพ" ที่เข้าใจร้านโชห่วยไทยอย่างลึกซึ้ง
+คุณรู้ทุกอย่างเกี่ยวกับร้านนี้ — ยอดขาย สต็อก ลูกหนี้ สินค้าใกล้หมดอายุ สภาพอากาศ ฤดูกาล
 
-Guidelines for answering:
-1. **Be Specific**: Always mention meaningful numbers (Quantity, Revenue ฿) when talking about products.
-2. **Provide Context**: Mention the timeframe (e.g., "In the last 30 days", "This month").
-3. **Analyze**: Don't just list data. Explain *what it means*.
-   - Example: "Oishi sells best (50 units), earning ฿1,000. It's your main revenue driver."
-   - Example: "Lay's is selling fast, you should check stock."
-4. **Tone**: Professional, encouraging, and succinct (use "ครับ/ค่ะ"). 
-5. **No Fluff**: Get straight to the point but keep the detail.
+หน้าที่ของคุณ:
+1. **ตอบทุกคำถามเกี่ยวกับร้าน** ด้วยข้อมูลจริงเสมอ (ยอดขาย, กำไร, สต็อก)
+2. **แนะนำกลยุทธ์การขาย** เช่น โปรโมชั่น, จัดวางสินค้า, เปลี่ยนราคา
+3. **ช่วยจัดการสต็อก** แจ้งเตือนสินค้าใกล้หมด/ค้างสต็อก
+4. **ติดตามลูกหนี้** แนะนำวิธีทวงถามอย่างเหมาะสม
+5. **วิเคราะห์เทรนด์** ช่วงเวลาขายดี, สินค้าที่ซื้อคู่กัน
 
-If the user asks something unrelated to the store, politely redirect them.
+แนวทางการตอบ:
+- ใช้ตัวเลขจริง (จำนวน, รายได้ ฿) เสมอ
+- บอก timeframe (เช่น "เดือนนี้", "30 วันที่ผ่านมา")
+- อย่าแค่บอกข้อมูล ให้วิเคราะห์ว่า *หมายความว่าอะไร* และ *ควรทำอะไร*
+- น้ำเสียงเป็นมิตร กระชับ ใช้ "ครับ/ค่ะ"
+- ถ้าถูกถามเรื่องที่ไม่เกี่ยวกับร้าน ให้กลับมาเรื่องร้านอย่างสุภาพ
+- ถ้าแนะนำโปรโมชั่น ให้อ้างอิงข้อมูลจริง เช่น สินค้าที่ซื้อคู่กัน (Best Pairs) หรือช่วงเวลาขายดี (Peak Hours)
 `.trim();
 
         // Initialize model per request to inject specific system instruction
@@ -433,23 +446,32 @@ router.get('/recommendations', async (req, res) => {
         const prompt = `
 ${data.context}
 
-คุณคือ AI ที่ปรึกษาธุรกิจอัจฉริยะสำหรับร้านโชห่วย ให้คำแนะนำที่คำนวณแม่นยำ ช่วยเจ้าของร้านตัดสินใจได้ทันที
-สร้าง 3 คำแนะนำสำหรับวันนี้ในรูปแบบ JSON array:
+คุณคือ "ผู้จัดการร้านมืออาชีพ" ที่เข้าใจร้านโชห่วยไทยอย่างลึกซึ้ง
+คุณรู้ทุกอย่างเกี่ยวกับร้านนี้ — ยอดขาย สต็อก ลูกหนี้ สินค้าใกล้หมดอายุ สภาพอากาศ ฤดูกาล
+หน้าที่ของคุณคือ ให้คำแนะนำ 3 ข้อที่ส่งผลกระทบต่อรายได้ร้านมากที่สุด
+
+📌 ลำดับความสำคัญ (เรียงจากสำคัญสุด):
+  A. 🚨 ด่วน — สินค้าหมดอายุแล้ว/ใกล้หมดอายุ (ทุกวันที่ไม่ทำ = เสียเงินจริง)
+  B. 💸 ลูกหนี้เกินกำหนด (เงินที่ค้างอยู่ ยิ่งนาน ยิ่งเก็บยาก)
+  C. 📦 สต็อกขายดีใกล้หมด (ขาดสต็อก = เสียโอกาส)
+  D. 💡 โปรโมชั่น/กลยุทธ์การขาย (สร้างรายได้เพิ่ม)
+
+สร้าง 3 คำแนะนำในรูปแบบ JSON array เรียงตามลำดับ A → B → C → D:
 
 [
   {
-    "type": "expiry" | "debt" | "stock" | "price",
-    "title": "หัวข้อสั้นๆ ไม่เกิน 8 คำ (ใช้ชื่อสินค้า/คนจริงจากข้อมูล)",
-    "detail": "รายละเอียด 1 บรรทัด",
-    "expected_impact": "ผลลัพธ์ที่คาดว่าจะได้ เช่น: คืนทุน 350 บาท (ปกติเสีย 500 บาท)",
-    "reason": "เหตุผลละเอียดพร้อมการคำนวณจากข้อมูลจริง",
-    "action_label": "ปุ่มสั้นๆ (เช่น ลด 20%, โปร 1แถม1)",
-    "icon": "alert-triangle | account-clock | package-variant | trending-up",
+    "type": "expiry" | "debt" | "stock" | "promotion",
     "urgency": "urgent" | "normal",
-    
-    "target_customers": ["ชื่อลูกหนี้ที่กล่าวถึง - เฉพาะ type=debt"],
-    "target_products": ["ชื่อสินค้าที่กล่าวถึง - เฉพาะ type=expiry"],
-    
+    "title": "หัวข้อสั้นๆ ไม่เกิน 8 คำ (ใช้ชื่อสินค้า/คนจริงจากข้อมูล)",
+    "detail": "รายละเอียด 1 บรรทัดชัดเจน",
+    "expected_impact": "ผลลัพธ์ที่คาดว่าจะได้ เช่น: คืนทุน 350 บาท (ปกติเสีย 500 บาท)",
+    "reason": "เหตุผลแบบมีโครงสร้าง (ดูกฎข้อ 6)",
+    "action_label": "ปุ่มสั้นๆ (เช่น ลด 20%, ทวงถาม, เติมสต็อก)",
+    "icon": "alert-triangle | account-clock | package-variant | trending-up",
+
+    "target_customers": ["ชื่อลูกหนี้ - เฉพาะ type=debt"],
+    "target_products": ["ชื่อสินค้า - เฉพาะ type=expiry/stock/promotion"],
+
     "recommended_discount": {
       "promotion_type": "discount_percent" | "buy_1_get_1" | "bundle",
       "percent": 20,
@@ -462,22 +484,39 @@ ${data.context}
   }
 ]
 
-กฎสำคัญ (PRODUCTION LEVEL):
-1. type=expiry ต้องมี recommended_discount เสมอ! คำนวณจากทุนและราคาขายจริง
-2. recommended_discount.reason ต้องแสดง:
-   - ทุน ฿X/ชิ้น ราคาขาย ฿Y/ชิ้น
-   - ลด X% = ราคา ฿Z (กำไร/ขาดทุนเท่าไหร่)
-   - เปรียบเทียบ 2-3 ระดับส่วนลด
-   - สรุปว่าแนะนำลดเท่าไหร่และทำไม
-2.1 ถ้าสต็อกเยอะมาก หรือขายไม่ออกนานๆ ให้พิจารณา "buy_1_get_1" (ซื้อ 1 แถม 1)
-   - recommended_discount = { "promotion_type": "buy_1_get_1", "percent": 50, "reason": "สต็อกเหลือเยอะ ระบายด่วน ซื้อ 1 แถม 1 จูงใจกว่าลดราคา" }
+กฎสำคัญ:
 
-3. สินค้าหมดอายุแล้ว → แนะนำ "ตัดสต็อก/ทิ้ง" แทนลดราคา (ขายไม่ได้แล้ว!)
-   recommended_discount = { "percent": 100, "reason": "สินค้าหมดอายุแล้ว ขายไม่ได้ ต้องตัดสต็อกทิ้ง", "action": "dispose" }
+1. **เรียงตามลำดับความสำคัญ**:
+   - ข้อ 1 = สำคัญที่สุด ต้องทำก่อน (เช่น สินค้าหมดอายุแล้ว)
+   - ข้อ 3 = สำคัญน้อยสุดในสามข้อ (เช่น โปรโมชั่นเพิ่มยอด)
+   - ถ้าไม่มีเรื่องด่วน ให้แนะนำกลยุทธ์เพิ่มยอดขายแทน
 
-4. type=debt ให้ระบุ target_customers เฉพาะ 1-2 คนที่เร่งด่วนที่สุด ไม่ใช่ทุกคน
+2. **type=expiry ต้องมี recommended_discount เสมอ!**
+   - คำนวณจากทุนและราคาขายจริง
+   - เปรียบเทียบ 2-3 ระดับส่วนลด ใน reason
 
-5. ใช้ชื่อสินค้า/คนจริงจากข้อมูลเท่านั้น ห้ามคิดขึ้นมาเอง!
+3. **สินค้าหมดอายุแล้ว** → แนะนำ "ตัดสต็อก/ทิ้ง" (ขายไม่ได้แล้ว!)
+   recommended_discount = { "promotion_type": "discount_percent", "percent": 100, "reason": "สินค้าหมดอายุแล้ว ต้องตัดสต็อกทิ้ง", "action": "dispose" }
+
+4. **type=debt** → ระบุ target_customers เฉพาะ 1-2 คนที่เร่งด่วนที่สุด
+
+5. **ชื่อสินค้า/ชื่อคน ต้อง copy ตัวอักษรเดิมเป๊ะๆ!**
+   - ห้ามแปลง ห้ามเปลี่ยนสระ/วรรณยุกต์ ห้ามสะกดใหม่
+   - ถ้าข้อมูลเขียนว่า "บุ๊ค" ต้องเขียน "บุ๊ค" ไม่ใช่ "บุก"
+   - ถ้าข้อมูลเขียนว่า "OISHI" ต้องเขียน "OISHI" ไม่ใช่ "โออิชิ"
+
+6. **reason ต้องมีโครงสร้างชัดเจน แยกเป็นข้อๆ**:
+   "1. สถานการณ์: [อธิบายว่าเกิดอะไรขึ้น เช่น สินค้า X เหลือ 20 ชิ้น หมดอายุอีก 3 วัน]\n2. คำนวณ: [ถ้าทิ้ง = เสีย ฿xx / ถ้าลดราคา xx% = คืนทุน ฿yy]\n3. สรุป: [แนะนำทำอะไร เพราะอะไร]"
+
+7. **type=promotion** (ใช้เมื่อไม่มีเรื่องด่วน):
+   - แนะนำโปรโมชั่นจากโลกจริงที่เหมาะกับร้าน เช่น:
+     • ซื้อคู่ลดราคา (จากสินค้า Best Pairs)
+     • โปรช่วงเวลา Peak Hours
+     • โปรตามสภาพอากาศ/ฤดูกาล (ร้อน→เครื่องดื่มเย็น, ฝน→บะหมี่กึ่งสำเร็จรูป)
+     • เพิ่มสต็อกสินค้ายอดนิยมก่อนหมด
+   - ต้องอ้างอิงข้อมูลจริง เช่น "สินค้า A ขายคู่กับ B บ่อย ควรจัดโปร bundle"
+
+8. **สต็อกเยอะมาก/ขายไม่ออกนาน** → พิจารณา "buy_1_get_1" (จูงใจกว่าลดราคา)
 
 Output JSON array เท่านั้น ไม่ต้องมีอะไรอื่น
 `.trim();
