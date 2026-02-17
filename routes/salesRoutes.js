@@ -294,11 +294,44 @@ app.post('/api/credit-sales', async (req, res) => {
             }
             customer = existingCustomer;
 
-            // Update image if provided and different (or just update to be sure)
-            if (customer_image && customer.image_url !== customer_image) {
+            // Handle Image Upload (if Base64)
+            let finalImageUrl = customer_image;
+            if (customer_image && customer_image.startsWith('data:image')) {
+                try {
+                    const base64Data = customer_image.split(',')[1];
+                    const buffer = Buffer.from(base64Data, 'base64');
+                    const fileName = `${storeId}/customer-${Date.now()}.jpg`;
+
+                    const { error: uploadError } = await supabaseAdmin
+                        .storage
+                        .from('customers')
+                        .upload(fileName, buffer, {
+                            contentType: 'image/jpeg',
+                            upsert: true
+                        });
+
+                    if (uploadError) throw uploadError;
+
+                    const { data: publicUrlData } = supabaseAdmin
+                        .storage
+                        .from('customers')
+                        .getPublicUrl(fileName);
+                    
+                    finalImageUrl = publicUrlData.publicUrl;
+                } catch (e) {
+                    console.error("Customer Image Upload Error:", e);
+                    // Fallback to null or keep original if upload fails? 
+                    // Let's keep original string if it fails, though it's huge.
+                    // Better to set null if upload fails to avoid DB error with huge string
+                    finalImageUrl = null; 
+                }
+            }
+
+            // Update image if provided and different
+            if (finalImageUrl && customer.image_url !== finalImageUrl) {
                 const { data: updatedCustomer, error: updateError } = await supabaseAdmin
                     .from('customers_info')
-                    .update({ image_url: customer_image })
+                    .update({ image_url: finalImageUrl })
                     .eq('id', customer_id)
                     .select()
                     .single();
@@ -323,6 +356,37 @@ app.post('/api/credit-sales', async (req, res) => {
                 console.log('Found existing customer by phone:', customer.id);
             } else {
                 console.log('Creating new customer:', customer_name);
+
+                // Handle Image Upload for New Customer
+                let finalImageUrl = customer_image;
+                if (customer_image && customer_image.startsWith('data:image')) {
+                    try {
+                        const base64Data = customer_image.split(',')[1];
+                        const buffer = Buffer.from(base64Data, 'base64');
+                        const fileName = `${storeId}/customer-${Date.now()}.jpg`;
+
+                        const { error: uploadError } = await supabaseAdmin
+                            .storage
+                            .from('customers')
+                            .upload(fileName, buffer, {
+                                contentType: 'image/jpeg',
+                                upsert: true
+                            });
+
+                        if (uploadError) throw uploadError;
+
+                        const { data: publicUrlData } = supabaseAdmin
+                            .storage
+                            .from('customers')
+                            .getPublicUrl(fileName);
+                        
+                        finalImageUrl = publicUrlData.publicUrl;
+                    } catch (e) {
+                        console.error("New Customer Image Upload Error:", e);
+                        finalImageUrl = null;
+                    }
+                }
+
                 // Create new customer with store_id
                 const { data: newCustomer, error: customerError } = await supabaseAdmin
                     .from('customers_info')
@@ -330,7 +394,7 @@ app.post('/api/credit-sales', async (req, res) => {
                         name: customer_name,
                         phone: customer_phone,
                         store_id: storeId,
-                        image_url: customer_image || null,
+                        image_url: finalImageUrl || null,
                     }])
                     .select()
                     .single();

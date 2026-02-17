@@ -7,6 +7,16 @@ const supabaseAdmin = createClient(
     process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+const multer = require('multer');
+
+const storage = multer.memoryStorage();
+const upload = multer({
+    storage: storage,
+    limits: {
+        fileSize: 5 * 1024 * 1024
+    }
+});
+
 // POST /api/branches/create-manager
 // Creates a manager account for a store
 router.post('/create-manager', async (req, res) => {
@@ -27,6 +37,12 @@ router.post('/create-manager', async (req, res) => {
 
         if (store.owner_id !== owner_id) {
             return res.status(403).json({ error: 'Not authorized' });
+        }
+
+        // Validate email format
+        const emailRegex = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ error: 'Invalid email format' });
         }
 
         // Create manager user account
@@ -108,6 +124,12 @@ router.post('/reset-credentials', async (req, res) => {
                 .eq('user_id', old_user_id);
         }
 
+        // Validate email format
+        const emailRegex = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+        if (!emailRegex.test(new_email)) {
+            return res.status(400).json({ error: 'Invalid email format' });
+        }
+
         // Create new manager
         const { data: userData, error: userError } = await supabaseAdmin.auth.admin.createUser({
             email: new_email,
@@ -146,6 +168,75 @@ router.post('/reset-credentials', async (req, res) => {
 
     } catch (error) {
         console.error('Reset credentials error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.post('/upload-image', upload.single('image'), async (req, res) => {
+    try {
+        const { store_id } = req.body;
+        const file = req.file;
+
+        if (!store_id) return res.status(400).json({ error: 'Store ID is required' });
+        if (!file) return res.status(400).json({ error: 'No image file uploaded' });
+
+        const owner_id = req.user.id;
+        const { data: store, error: storeError } = await supabaseAdmin
+            .from('stores')
+            .select('id, owner_id')
+            .eq('id', store_id)
+            .single();
+
+        if (storeError || !store) {
+            return res.status(404).json({ error: 'Store not found' });
+        }
+
+        if (store.owner_id !== owner_id) {
+            const { data: member } = await supabaseAdmin
+                .from('store_members')
+                .select('id')
+                .eq('store_id', store_id)
+                .eq('user_id', owner_id)
+                .single();
+            if (!member) {
+                return res.status(403).json({ error: 'Not authorized' });
+            }
+        }
+
+        const fileExt = file.originalname.split('.').pop();
+        const fileName = `${Date.now()}_${Math.round(Math.random() * 1000)}.${fileExt}`;
+        const filePath = `${store_id}/${fileName}`;
+
+        const { data: uploadData, error: uploadError } = await supabaseAdmin
+            .storage
+            .from('store_images')
+            .upload(filePath, file.buffer, {
+                contentType: file.mimetype,
+                upsert: true
+            });
+        if (uploadError) throw uploadError;
+
+        const { data: urlData } = supabaseAdmin
+            .storage
+            .from('store_images')
+            .getPublicUrl(filePath);
+
+        const publicUrl = urlData.publicUrl;
+        const { error: updateError } = await supabaseAdmin
+            .from('stores')
+            .update({ image_url: publicUrl })
+            .eq('id', store_id);
+        if (updateError) throw updateError;
+
+        res.json({
+            success: true,
+            message: 'Image uploaded successfully',
+            imageUrl: publicUrl
+        });
+
+
+    } catch (error) {
+        console.error('Upload error:', error);
         res.status(500).json({ error: error.message });
     }
 });
