@@ -292,19 +292,31 @@ router.delete('/delete', async (req, res) => {
             .delete()
             .eq('store_id', store_id);
 
-        // 5. Delete store_settings
+        // 5. Delete ai_recommendations
         await supabaseAdmin
-            .from('store_settings')
+            .from('ai_recommendations')
             .delete()
             .eq('store_id', store_id);
 
-        // 6. Delete products
+        // 6. Delete notifications
         await supabaseAdmin
-            .from('products')
+            .from('notifications')
             .delete()
             .eq('store_id', store_id);
 
-        // 7. Delete order_items for orders in this store
+        // 7. Delete backup_logs
+        await supabaseAdmin
+            .from('backup_logs')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 8. Delete account_transactions
+        await supabaseAdmin
+            .from('account_transactions')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 9. Get all orders for this store
         const { data: orders } = await supabaseAdmin
             .from('orders')
             .select('id')
@@ -312,19 +324,99 @@ router.delete('/delete', async (req, res) => {
 
         if (orders && orders.length > 0) {
             const orderIds = orders.map(o => o.id);
+
+            // 10. Delete payments for these orders
+            await supabaseAdmin
+                .from('payments')
+                .delete()
+                .in('order_id', orderIds);
+
+            // 11. Delete order_items for these orders
             await supabaseAdmin
                 .from('order_items')
                 .delete()
                 .in('order_id', orderIds);
+
+            // 12. Delete credit_accounts for these orders
+            await supabaseAdmin
+                .from('credit_accounts')
+                .delete()
+                .in('order_id', orderIds);
         }
 
-        // 8. Delete orders
+        // 13. Delete orders
         await supabaseAdmin
             .from('orders')
             .delete()
             .eq('store_id', store_id);
 
-        // 9. Finally, delete the store
+        // 14. Get all products for this store
+        const { data: products } = await supabaseAdmin
+            .from('products')
+            .select('id')
+            .eq('store_id', store_id);
+
+        if (products && products.length > 0) {
+            const productIds = products.map(p => p.id);
+
+            // 15. Delete inventory_transactions for these products
+            await supabaseAdmin
+                .from('inventory_transactions')
+                .delete()
+                .in('product_id', productIds);
+
+            // 16. Delete product_batches for these products
+            await supabaseAdmin
+                .from('product_batches')
+                .delete()
+                .in('product_id', productIds);
+
+            // 17. Get all promotions for this store to delete promotion_items
+            const { data: promotions } = await supabaseAdmin
+                .from('promotions')
+                .select('id')
+                .eq('store_id', store_id);
+
+            if (promotions && promotions.length > 0) {
+                const promoIds = promotions.map(p => p.id);
+                await supabaseAdmin
+                    .from('promotion_items')
+                    .delete()
+                    .in('promotion_id', promoIds);
+            }
+        }
+
+        // 18. Delete promotions
+        await supabaseAdmin
+            .from('promotions')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 19. Delete customers_info
+        await supabaseAdmin
+            .from('customers_info')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 20. Delete products
+        await supabaseAdmin
+            .from('products')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 21. Delete product_categories
+        await supabaseAdmin
+            .from('product_categories')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 22. Delete store_order_counters
+        await supabaseAdmin
+            .from('store_order_counters')
+            .delete()
+            .eq('store_id', store_id);
+
+        // 23. Finally, delete the store
         const { error: deleteError } = await supabaseAdmin
             .from('stores')
             .delete()

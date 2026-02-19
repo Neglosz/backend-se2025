@@ -3,6 +3,7 @@ const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const path = require('path');
+const { error } = require('console');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 // Initialize Gemini
@@ -60,10 +61,10 @@ const getWeatherData = async (lat, lon) => {
 
 // Helper to check store access (Simplified version of middleware)
 const getStoreSummary = async (storeId, lat, lon) => {
-    const today = new Date();
-    const startOfDay = new Date(today.setHours(0, 0, 0, 0)).toISOString();
-    const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1).toISOString();
-    const thirtyDaysAgo = new Date(today.setDate(today.getDate() - 30)).toISOString();
+    const now = new Date();
+    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const thirtyDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30).toISOString();
 
     // Fetch External Context (Weather & Location)
     const [weather, address] = await Promise.all([
@@ -90,6 +91,18 @@ const getStoreSummary = async (storeId, lat, lon) => {
         .from('products')
         .select('id, name, stock_qty, cost_price, price, low_stock_threshold')
         .eq('store_id', storeId);
+
+    const today = new Date().toISOString().split('T')[0];
+    const { data: activePromos } = await supabaseAdmin
+        .from('promotion_items')
+        .select('product_id, promotions!inner(name, type, discount_value, end_date)')
+        .eq('promotions.is_active', true)
+        .eq('promotions.store_id', storeId)
+        .lte('promotions.start_date', today)
+        .gte('promotions.end_date', today);
+
+    const productsWithPromo = new Set(activePromos?.map(p => p.product_id) || []);
+    const activePromoList = activePromos?.map(p => `• ${p.promotions.name} (${p.promotions.type}, หมด ${p.promotions.end_date})`) || [];
 
     // B2. Product Batches with Expiry (within 14 days)
     const fourteenDaysLater = new Date();
@@ -314,6 +327,9 @@ ${expiryListText}
 - Best Pairs: ${topPairs.join(' | ') || 'None'}
 - Peak Time: ${peakHourStr} (Best Day: ${bestDay})
 
+🏷️ โปรโมชั่นที่ใช้อยู่ตอนนี้:
+${activePromoList.join('\n') || 'ไม่มีโปรโมชั่น active'}
+
 GOAL: ใช้ข้อมูลจริงข้างบนเท่านั้น ห้ามคิดชื่อคน/สินค้าขึ้นมาเอง! ตอบคำถามเกี่ยวกับ "ร้านนี้" หรือ "เดือนนี้" โดยใช้ข้อมูลใน section 💰 FINANCIALS (This Month) และ 🏆 BEST SELLERS (This Month)
 `.trim();
 
@@ -355,12 +371,41 @@ const retryWithBackoff = async (fn, retries = 3, delay = 1000) => {
     }
 };
 
+const chatRateLimit = {};
+const CHAT_LIMIT = 20;
+const CHAT_WINDOW = 5 * 60 * 1000;
+
+const checkChatRateLimit = (userId) => {
+    const now = Date.now();
+    if (!chatRateLimit[userId]) {
+        chatRateLimit[userId] = { count: 1, resetAt: now + CHAT_WINDOW };
+        return true;
+    }
+    if (now > chatRateLimit[userId].resetAt) {
+        chatRateLimit[userId] = { count: 1, resetAt: now + CHAT_WINDOW };
+        return true;
+    }
+    if (chatRateLimit[userId].count >= CHAT_LIMIT) {
+        return false;
+    }
+    chatRateLimit[userId].count++;
+    return true;
+}
+
 router.post('/chat', async (req, res) => {
     try {
         const { message, lat, lon, history } = req.body;
         const storeId = req.headers['x-store-id'];
+        const userId = req.headers['x-user-id'] || req.user?.id;
 
         if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+
+        if (userId && !checkChatRateLimit(userId)) {
+            return res.status(429).json({
+                success: false,
+                error: 'ส่งข้อความมากเกินไป กรุณารอสักครู่ (จำกัด 20 ข้อความ/5นาที)'
+            })
+        }
 
         // Get fresh context
         const data = await getStoreSummary(storeId, lat, lon);
@@ -473,8 +518,13 @@ ${data.context}
     "target_products": ["ชื่อสินค้า - เฉพาะ type=expiry/stock/promotion"],
 
     "recommended_discount": {
-      "promotion_type": "discount_percent" | "buy_1_get_1" | "bundle",
+      "promotion_type": "discount_percent" | "buy_x_get_y" | "bundle",
       "percent": 20,
+      "discount_amount": 10,
+      "min_qty": 2,
+      "free_qty": 1,
+      "min_spend":100,
+      "days_valid": 3,
       "price_after_discount": 32,
       "profit_per_unit": 2,
       "total_recovery": 320,
@@ -516,14 +566,30 @@ ${data.context}
      • เพิ่มสต็อกสินค้ายอดนิยมก่อนหมด
    - ต้องอ้างอิงข้อมูลจริง เช่น "สินค้า A ขายคู่กับ B บ่อย ควรจัดโปร bundle"
 
-8. **สต็อกเยอะมาก/ขายไม่ออกนาน** → พิจารณา "buy_1_get_1" (จูงใจกว่าลดราคา)
+8. **สต็อกเยอะมาก/ขายไม่ออกนาน** → พิจารณา "buy_x_get_y" (จูงใจกว่าลดราคา)
+9. **days_valid** กำหนดตามประเภท:
+   - type=expiry → 1-3 วัน (เร่งขาย)
+   - type=promotion/bundle → 5-14 วัน (ให้เวลาลูกค้า)
+   - type=stock → 7 วัน
+10. **ห้ามแนะนำโปรสินค้าที่มีโปรอยู่แล้ว!**
+   - ดูจาก section 🏷️ ถ้าสินค้ามีโปรอยู่แล้ว ให้ข้ามไปแนะนำสินค้าอื่น
+   - หรือแนะนำประเภทอื่น เช่น stock/debt แทน
 
 Output JSON array เท่านั้น ไม่ต้องมีอะไรอื่น
 `.trim();
 
         const result = await retryWithBackoff(() => model.generateContent(prompt));
         const text = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
-        const suggestions = JSON.parse(text);
+        let suggestions;
+        try {
+            suggestions = JSON.parse(text);
+        } catch (parseError) {
+            console.error('AI returned invalid JSON:', text.substring(0, 200));
+            return res.status(500).json({
+                success: false,
+                error: 'AI ตอบกลับผิดรูปแบบ กรุณาลองใหม่อีกครั้ง'
+            });
+        }
 
         // 3. Save to ai_recommendations table
         // Inject real data into payload based on type
@@ -745,6 +811,41 @@ router.get('/recommendations/stats', async (req, res) => {
     }
 });
 
+
+router.get('/active-promotions', async (req, res) => {
+    const storeId = req.headers['x-store-id'];
+    const today = new Date().toISOString().split('T')[0];
+
+    const { data, error } = await supabaseAdmin
+        .from('promotions')
+        .select(`
+            id, name, type, discount_value, 
+            min_qty_required, free_qty, min_spend,
+            start_date, end_date, is_active, created_at,
+            promotion_items(product_id, products(name))
+        `)
+        .eq('store_id', storeId)
+        .eq('is_active', true)
+        .lte('start_date', today)
+        .gte('end_date', today)
+        .order('created_at', { ascending: false });
+    res.json({ success: true, data: data || [] });
+});
+
+router.patch('/promotions/:id/deactivate', async (req, res) => {
+    const { id } = req.params;
+    const storeId = req.headers['x-store-id'];
+    const { data, error } = await supabaseAdmin
+        .from('promotions')
+        .update({ is_active: false })
+        .eq('id', id)
+        .eq('store_id', storeId)
+        .select()
+        .single();
+    if (error) throw error;
+    res.json({ success: true, data });
+})
+
 // ==================== AI ACTION ENDPOINTS ====================
 
 // Apply Promotion - Create a time-limited discount for products
@@ -752,7 +853,7 @@ router.post('/apply-promotion', async (req, res) => {
     try {
         const storeId = req.headers['x-store-id'];
         const userId = req.headers['x-user-id'] || req.user?.id;
-        const { recommendationId, productNames, discountPercent, promotionType = 'discount_percent', daysValid = 3 } = req.body;
+        const { recommendationId, productNames, discountPercent, promotionType = 'discount_percent', daysValid = 3, minQtyRequired, freeQtyAmount, discountAmount, minSpend } = req.body;
 
         if (!storeId || !userId) {
             return res.status(400).json({ success: false, error: 'Store and User ID required' });
@@ -771,21 +872,44 @@ router.post('/apply-promotion', async (req, res) => {
             return res.status(404).json({ success: false, error: 'No matching products found' });
         }
 
+        const today = new Date().toISOString().split('T')[0];
+        const { data: existingPromos } = await supabaseAdmin
+            .from('promotion_items')
+            .select('product_id, promotions!inner(name)')
+            .in('product_id', products.map(p => p.id))
+            .eq('promotions.is_active', true)
+            .lte('promotions.start_date', today)
+            .gte('promotions.end_date', today);
+
+        if (existingPromos && existingPromos.length > 0) {
+            const conflicting = existingPromos.map(p => p.promotions.name);
+            return res.status(400).json({
+                success: false,
+                error: `สินค้าบางชิ้นมีโปรโมชั่นอยู่แล้ว: ${[...new Set(conflicting)].join(', ')}`
+            });
+        }
+
         // 2. Setup Promotion Details
         let promoDiscountValue = discountPercent || 20;
         let dbPromoType = 'discount_percent';
         let minQty = 0;
         let freeQty = 0;
+        let promoMinSpend = null;
         let promoName = `AI แนะนำ: ลด ${promoDiscountValue}% - ${products.map(p => p.name).join(', ')}`;
 
-        if (promotionType === 'buy_1_get_1') {
+        if (promotionType === 'buy_x_get_y') {
             dbPromoType = 'buy_x_get_y';
-            minQty = 1;
-            freeQty = 1;
-            promoName = `AI แนะนำ: ซื้อ 1 แถม 1 - ${products.map(p => p.name).join(', ')}`;
+            minQty = minQtyRequired || 1;
+            freeQty = freeQtyAmount || 1;
+            promoName = `AI แนะนำ: ซื้อ ${minQty} แถม ${freeQty} - ${products.map(p => p.name).join(', ')}`;
             promoDiscountValue = 0; // Not used for this type
+        } else if (promotionType === 'discount_amount') {
+            dbPromoType = 'discount_amount';
+            promoDiscountValue = discountAmount || 10;
+            promoName = `AI แนะนำ: ลด ฿${promoDiscountValue} - ${products.map(p => p.name).join(', ')}`;
         } else if (promotionType === 'bundle') {
             dbPromoType = 'bundle';
+            promoMinSpend = minSpend || null;
             // Logic for bundle could be detailed later, assuming simple discount for now
             promoName = `AI แนะนำ: ซื้อคู่ถูกกว่า - ${products.map(p => p.name).join(', ')}`;
         }
@@ -793,6 +917,19 @@ router.post('/apply-promotion', async (req, res) => {
         // 3. Create Promotion record
         const endDate = new Date();
         endDate.setDate(endDate.getDate() + daysValid);
+
+        let description = `AI แนะนำ: ${promoName}`;
+
+        if (recommendationId) {
+            const { data: rec } = await supabaseAdmin
+                .from('ai_recommendations')
+                .select('detail, payload')
+                .eq('id', recommendationId)
+                .single();
+            if (rec) {
+                description = rec.detail || rec.payload?.reason || description;
+            }
+        }
 
         const { data: promo, error: promoError } = await supabaseAdmin
             .from('promotions')
@@ -805,7 +942,10 @@ router.post('/apply-promotion', async (req, res) => {
                 start_date: new Date().toISOString().split('T')[0],
                 end_date: endDate.toISOString().split('T')[0],
                 store_id: storeId,
-                is_active: true
+                is_active: true,
+                created_by: userId,
+                description: description,
+                min_spend: promoMinSpend
             }])
             .select()
             .single();
@@ -844,7 +984,7 @@ router.post('/apply-promotion', async (req, res) => {
                     id: p.id,
                     name: p.name,
                     originalPrice: p.price,
-                    discountedPrice: Math.round(p.price * (1 - promoDiscountValue / 100))
+                    discountedPrice: dbPromoType === 'discount_percent' ? Math.round(p.price * (1 - promoDiscountValue / 100)) : dbPromoType === 'discount_amount' ? Math.max(0, p.price - promoDiscountValue) : p.price
                 })),
                 expiresAt: endDate.toISOString()
             }
