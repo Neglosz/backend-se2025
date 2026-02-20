@@ -105,7 +105,7 @@ const registerSalesRoutes = ({
                         // Update Batch
                         await supabaseAdmin
                             .from('product_batches')
-                            .update({ remaining_qty: availableInBatch - deductAmount })
+                            .update({ remaining_qty: parseFloat((availableInBatch - deductAmount).toFixed(3)) })
                             .eq('id', batch.id);
 
                         // Insert Inventory Log
@@ -487,7 +487,7 @@ const registerSalesRoutes = ({
                             // Update Batch
                             await supabaseAdmin
                                 .from('product_batches')
-                                .update({ remaining_qty: availableInBatch - deductAmount })
+                                .update({ remaining_qty: parseFloat((availableInBatch - deductAmount).toFixed(3)) })
                                 .eq('id', batch.id);
 
                             // Insert Inventory Log

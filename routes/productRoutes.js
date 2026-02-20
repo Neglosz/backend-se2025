@@ -467,7 +467,7 @@ const registerProductRoutes = ({
                     cost_price: parseFloat(costPrice) || 0,
                     price: parseFloat(salePrice) || 0,
                     low_stock_threshold: parseFloat(lowStockThreshold) || 0,
-                    unit_type: isWeightable ? 'kg' : (unitType || 'ชิ้น'),
+                    unit_type: unitType || 'ชิ้น',
                     store_id: storeId,
                     store_id: storeId,
                     image_url: await (async () => {
