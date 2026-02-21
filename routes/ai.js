@@ -81,7 +81,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
         .from('orders')
         .select(`
             id, total_amount, payment_type, created_at,
-            order_items (qty, price_per_unit, cost_price_at_sale, subtotal, products (id, name))
+            order_items (qty, price_per_unit, cost_price_at_sale, subtotal, unit, products (id, name, unit_type))
         `)
         .eq('store_id', storeId)
         .gte('created_at', thirtyDaysAgo);
@@ -109,16 +109,17 @@ const getStoreSummary = async (storeId, lat, lon) => {
     fourteenDaysLater.setDate(fourteenDaysLater.getDate() + 14);
     const { data: nearExpiryBatches } = await supabaseAdmin
         .from('product_batches')
-        .select('qty, expire_date, products!inner(name, store_id, cost_price, price)')
+        .select('remaining_qty, expire_date, products!inner(name, store_id, cost_price, price, unit_type)')
         .eq('products.store_id', storeId)
-        .gt('qty', 0)
+        .gt('remaining_qty', 0)
         .lte('expire_date', fourteenDaysLater.toISOString())
         .order('expire_date', { ascending: true });
 
     // Format expiry list for AI with cost & price for profit calculation
     const expiryList = nearExpiryBatches?.map(b => {
         const name = b.products?.name || 'ไม่ระบุชื่อ';
-        const qty = b.qty;
+        const qty = parseFloat(b.remaining_qty) || 0;
+        const unit = b.products?.unit_type || 'ชิ้น';
         const costPrice = parseFloat(b.products?.cost_price) || 0;
         const sellPrice = parseFloat(b.products?.price) || 0;
         const expDate = b.expire_date ? new Date(b.expire_date) : null;
@@ -131,7 +132,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
             else if (daysUntilExpiry === 0) status = 'หมดอายุวันนี้';
             else status = `อีก ${daysUntilExpiry} วัน`;
         }
-        return { name, qty, status, daysUntilExpiry, costPrice, sellPrice };
+        return { name, qty, status, daysUntilExpiry, costPrice, sellPrice, unit };
     }) || [];
 
     // C. Debt with Customer Names
@@ -215,21 +216,28 @@ const getStoreSummary = async (storeId, lat, lon) => {
         let orderCost = 0;
         const itemNames = [];
         (order.order_items || []).forEach(item => {
-            const qty = parseFloat(item.qty);
+            const rawQty = parseFloat(item.qty);
+            let normalizedQty = rawQty;
+            let unitType = item.unit || item.products?.unit_type || 'ชิ้น';
+            if (unitType === 'กรัม' || unitType === 'g') {
+                normalizedQty = rawQty / 1000;
+                unitType = 'กก.';
+            } else if (unitType === 'ขีด') {
+                normalizedQty = rawQty / 10;
+                unitType = 'กก.'
+            }
+
             const cost = parseFloat(item.cost_price_at_sale) || 0;
-            const price = parseFloat(item.price_per_unit || 0) * qty; // Rough revenue
+            const price = parseFloat(item.subtotal) || (parseFloat(item.price_per_unit || 0) * rawQty);
             const pid = item.products?.id;
             const pname = item.products?.name || 'Unknown';
             if (!pid) return;
-
-            orderCost += (cost * qty);
-            productSalesQty[pid] = (productSalesQty[pid] || 0) + qty;
+            orderCost += (cost * rawQty);
+            productSalesQty[pid] = (productSalesQty[pid] || 0) + normalizedQty;
             itemNames.push(pname);
-
-            // Track Monthly Best Sellers
             if (isThisMonth) {
-                if (!productStatsMonth[pid]) productStatsMonth[pid] = { name: pname, qty: 0, revenue: 0 };
-                productStatsMonth[pid].qty += qty;
+                if (!productStatsMonth[pid]) productStatsMonth[pid] = { name: pname, qty: 0, revenue: 0, unit: unitType };
+                productStatsMonth[pid].qty += normalizedQty;
                 productStatsMonth[pid].revenue += price;
             }
         });
@@ -272,7 +280,10 @@ const getStoreSummary = async (storeId, lat, lon) => {
     const bestSellersQty = Object.values(productStatsMonth)
         .sort((a, b) => b.qty - a.qty)
         .slice(0, 5)
-        .map(p => `${p.name} (${p.qty} ชิ้น)`)
+        .map(p => {
+            const displayQty = (p.qty % 1 !== 0) ? p.qty.toFixed(2) : p.qty;
+            return `${p.name} (${displayQty} ${p.unit})`;
+        })
         .join(', ');
 
     const bestSellersRev = Object.values(productStatsMonth)
@@ -292,7 +303,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
 
     // Format expiry list for context WITH cost & price for profit calculation
     const expiryListText = expiryList.slice(0, 5).map(e =>
-        `• ${e.name}: ${e.qty} ชิ้น (${e.status}) | ทุน ฿${e.costPrice} ราคาขาย ฿${e.sellPrice}`
+        `• ${e.name}: ${e.qty} ${e.unit} (${e.status}) | ทุน ฿${e.costPrice} ราคาขาย ฿${e.sellPrice}`
     ).join('\n') || 'ไม่มีสินค้าใกล้หมดอายุ';
 
     // Format Date Range
@@ -413,8 +424,8 @@ router.post('/chat', async (req, res) => {
         const systemInstruction = `
 ${data.context}
 
-คุณคือ "ผู้จัดการร้านมืออาชีพ" ที่เข้าใจร้านโชห่วยไทยอย่างลึกซึ้ง
-คุณรู้ทุกอย่างเกี่ยวกับร้านนี้ — ยอดขาย สต็อก ลูกหนี้ สินค้าใกล้หมดอายุ สภาพอากาศ ฤดูกาล
+คุณคือ "ผู้จัดการร้านมืออาชีพ" ที่เข้าใจร้านโชห่วยไทยอย่างลึกซึ้ง เป็นมิตร
+คุณรู้ทุกอย่างเกี่ยวกับร้านนี้ — ยอดขาย สต็อก ลูกหนี้ สินค้าใกล้หมดอายุ สภาพอากาศ ฤดูกาล โดยรายงานสถานการณ์ร้านสั้นกระชับที่สุด
 
 หน้าที่ของคุณ:
 1. **ตอบทุกคำถามเกี่ยวกับร้าน** ด้วยข้อมูลจริงเสมอ (ยอดขาย, กำไร, สต็อก)
@@ -422,6 +433,14 @@ ${data.context}
 3. **ช่วยจัดการสต็อก** แจ้งเตือนสินค้าใกล้หมด/ค้างสต็อก
 4. **ติดตามลูกหนี้** แนะนำวิธีทวงถามอย่างเหมาะสม
 5. **วิเคราะห์เทรนด์** ช่วงเวลาขายดี, สินค้าที่ซื้อคู่กัน
+
+⚠️ กฎเหล็กในการคุย (ห้ามฝ่าฝืน):
+1. **ห้ามพิมพ์เครื่องหมายดอกจัน (*) หรือเครื่องหมายขีด (-) นำหน้าข้อความเด็ดขาด**
+2. ห้ามพูดคำว่า "ครับ/ค่ะ" ซ้ำซ้อนตอนท้ายประโยค ให้พูดเหมือนอัดเสียงส่งไลน์ (เช่น "วันนี้หมูเนื้อแดงขายดีมาก รีบสั่งของเลยนะ")
+3. **เลิกสรุปยอดตัวเลขยาวๆ** (มองเลขไม่ทัน) ให้จับแค่ประเด็นเด่นสุด 2-3 เรื่องพอ 
+4. **ขึ้นบรรทัดใหม่ (Enter) ทุกครั้ง** เมื่อเปลี่ยนหัวข้อ หรือเปลี่ยนสินค้า เพื่อให้อ่านง่าย
+5. ใช้ 🎯 นำหน้าเรื่องเด่นสุด, 📦 นำหน้าเรื่องสต็อก และ ⚠️ นำหน้าเรื่องเตือนภัย แทนการทำ Bullet Point
+6. 🚫 **ห้ามแนะนำให้ขายสินค้าที่ "หมดอายุแล้ว" เด็ดขาด!** ถ้าเจอของที่สถานะบอกว่าหมดอายุแล้ว ให้เตือนว่า "ทิ้งด่วน" หรือ "ส่งคืนเซลล์" ทันที ส่วนของที่ "กำลังจะหมดอายุ" (เหลืออีก X วัน) ค่อยแนะนำให้จัดโปรโมรชั่นลดราคา
 
 แนวทางการตอบ:
 - ใช้ตัวเลขจริง (จำนวน, รายได้ ฿) เสมอ
