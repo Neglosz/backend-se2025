@@ -104,7 +104,25 @@ const getStoreSummary = async (storeId, lat, lon) => {
     const productsWithPromo = new Set(activePromos?.map(p => p.product_id) || []);
     const activePromoList = activePromos?.map(p => `• ${p.promotions.name} (${p.promotions.type}, หมด ${p.promotions.end_date})`) || [];
 
-    // B2. Product Batches with Expiry (within 14 days)
+    // B2a. สินค้าที่หมดอายุแล้ว (ต้องทิ้ง/ตัดสต็อก)
+    const todayISO = new Date().toISOString();
+    const { data: expiredBatches } = await supabaseAdmin
+        .from('product_batches')
+        .select('remaining_qty, expire_date, products!inner(name, store_id, cost_price, price, unit_type)')
+        .eq('products.store_id', storeId)
+        .gt('remaining_qty', 0)
+        .lt('expire_date', todayISO)        // หมดอายุแล้ว (< วันนี้)
+        .order('expire_date', { ascending: true });
+    
+    const { data: expenses } = await supabaseAdmin
+        .from('account_transactions')
+        .select('amount')
+        .eq('store_id', storeId)
+        .eq('trans_type', 'expense')
+        .gte('trans_date', thirtyDaysAgo);
+    const totalExpenses = expenses?.reduce((sum, current) => sum + (parseFloat(current.amount) || 0), 0) || 0;
+
+    // B2b. สินค้าใกล้หมดอายุ (ยังขายได้ จัดโปรลดราคา)
     const fourteenDaysLater = new Date();
     fourteenDaysLater.setDate(fourteenDaysLater.getDate() + 14);
     const { data: nearExpiryBatches } = await supabaseAdmin
@@ -112,27 +130,29 @@ const getStoreSummary = async (storeId, lat, lon) => {
         .select('remaining_qty, expire_date, products!inner(name, store_id, cost_price, price, unit_type)')
         .eq('products.store_id', storeId)
         .gt('remaining_qty', 0)
-        .lte('expire_date', fourteenDaysLater.toISOString())
+        .gte('expire_date', todayISO)                         // ยังไม่หมดอายุ (>= วันนี้)
+        .lte('expire_date', fourteenDaysLater.toISOString())  // ภายใน 14 วัน
         .order('expire_date', { ascending: true });
 
-    // Format expiry list for AI with cost & price for profit calculation
+    // List ของที่หมดอายุแล้ว (ต้องทิ้ง/ตัดสต็อก ห้ามขาย!)
+    const expiredList = expiredBatches?.map(b => {
+        const name = b.products?.name || 'ไม่ระบุชื่อ';
+        const qty = parseFloat(b.remaining_qty) || 0;
+        const unit = b.products?.unit_type || 'ชิ้น';
+        const costPrice = parseFloat(b.products?.cost_price) || 0;
+        const sellPrice = parseFloat(b.products?.price) || 0;
+        const daysAgo = Math.floor((new Date() - new Date(b.expire_date)) / (1000 * 60 * 60 * 24));
+        return { name, qty, unit, costPrice, sellPrice, status: `หมดอายุแล้ว ${daysAgo} วัน` };
+    }) || [];
+    // List ของใกล้หมดอายุ (ยังขายได้ ควรจัดโปร)
     const expiryList = nearExpiryBatches?.map(b => {
         const name = b.products?.name || 'ไม่ระบุชื่อ';
         const qty = parseFloat(b.remaining_qty) || 0;
         const unit = b.products?.unit_type || 'ชิ้น';
         const costPrice = parseFloat(b.products?.cost_price) || 0;
         const sellPrice = parseFloat(b.products?.price) || 0;
-        const expDate = b.expire_date ? new Date(b.expire_date) : null;
-        const today = new Date();
-        let status = '';
-        let daysUntilExpiry = null;
-        if (expDate) {
-            daysUntilExpiry = Math.floor((expDate - today) / (1000 * 60 * 60 * 24));
-            if (daysUntilExpiry < 0) status = `หมดอายุแล้ว ${Math.abs(daysUntilExpiry)} วัน`;
-            else if (daysUntilExpiry === 0) status = 'หมดอายุวันนี้';
-            else status = `อีก ${daysUntilExpiry} วัน`;
-        }
-        return { name, qty, status, daysUntilExpiry, costPrice, sellPrice, unit };
+        const daysLeft = Math.floor((new Date(b.expire_date) - new Date()) / (1000 * 60 * 60 * 24));
+        return { name, qty, unit, costPrice, sellPrice, status: `อีก ${daysLeft} วัน`, daysUntilExpiry: daysLeft };
     }) || [];
 
     // C. Debt with Customer Names
@@ -256,14 +276,41 @@ const getStoreSummary = async (storeId, lat, lon) => {
     });
 
     const opportunities = [], sunkCosts = [], winners = [];
+    const deadStockList = [];
+    
+    const lowMarginHighVolume = []; // ขายดีแต่กำไรบางเฉียบ
+    const highMarginLowVolume = []; // กำไรงามแต่ขายไม่ออก
     products?.forEach(p => {
         const soldQty = productSalesQty[p.id] || 0;
         const threshold = parseFloat(p.low_stock_threshold) || 5;
         const margin = (parseFloat(p.price) - parseFloat(p.cost_price));
-
-        if (soldQty > 10 && p.stock_qty <= threshold) opportunities.push(`${p.name} (Sold ${soldQty}, Left ${p.stock_qty})`);
-        if (soldQty === 0 && p.stock_qty > 10) sunkCosts.push(`${p.name} (Stock ${p.stock_qty}, 0 Sales)`);
+        const price = parseFloat(p.price) || 1; // กันหาร 0
+        const marginPercent = Math.round((margin / price) * 100);
+        // 1. ขายดีแต่ใกล้หมด -> คำนวณจำนวนที่ควรสั่งเพิ่ม (เพื่อให้พอรันไปอีก 14 วัน)
+        if (soldQty > 10 && p.stock_qty <= threshold) {
+            const dailySales = soldQty / 30;
+            const suggestedOrder = Math.ceil((dailySales * 14) - p.stock_qty);
+            const orderText = suggestedOrder > 0 ? `ควรสั่งเพิ่มด่วน ${suggestedOrder} ชิ้น` : "ควรเติมสต็อก";
+            opportunities.push(`${p.name} (ขายไป ${soldQty}, เหลือ ${p.stock_qty} | ⚠️ ${orderText})`);
+        }
+        
+        if (soldQty === 0 && p.stock_qty > 10) {
+            sunkCosts.push(`${p.name} (Stock ${p.stock_qty}, 0 Sales)`);
+            deadStockList.push({
+                name: p.name,
+                qty: parseFloat(p.stock_qty) || 0,
+                unit: p.unit_type || 'ชิ้น',
+                costPrice: parseFloat(p.cost_price) || 0,
+                sellPrice: parseFloat(p.price) || 0
+            });
+            // ถ้ากำไรดีมากแต่ขายนิ่ง
+            if (marginPercent > 40) highMarginLowVolume.push(`${p.name} (กำไรตั้ง ${marginPercent}%)`);
+        }
         if (soldQty * margin > 1000) winners.push(p.name);
+        // 3. ขายกระจุยแต่กำไรนิดเดียว (ต่ำกว่า 15%)
+        if (soldQty > 15 && marginPercent < 15) {
+            lowMarginHighVolume.push(`${p.name} (ขายไป ${soldQty} ชิ้น แต่กำไรชิ้นละ ${marginPercent}%)`);
+        }
     });
 
     const monthNum = new Date().getMonth() + 1;
@@ -302,21 +349,28 @@ const getStoreSummary = async (storeId, lat, lon) => {
     ).join('\n') || 'ไม่มีลูกหนี้';
 
     // Format expiry list for context WITH cost & price for profit calculation
+    const expiredListText = expiredList.slice(0, 5).map(e =>
+        `• ❌ ${e.name}: ${e.qty} ${e.unit} (${e.status}) | ทุน ฿${e.costPrice} → ต้องตัดสต็อกทิ้ง!`
+    ).join('\n') || '';
+    // ของใกล้หมดอายุ (ยังจัดโปรได้)
     const expiryListText = expiryList.slice(0, 5).map(e =>
-        `• ${e.name}: ${e.qty} ${e.unit} (${e.status}) | ทุน ฿${e.costPrice} ราคาขาย ฿${e.sellPrice}`
+        `• ⚠️ ${e.name}: ${e.qty} ${e.unit} (${e.status}) | ทุน ฿${e.costPrice} ราคาขาย ฿${e.sellPrice}`
     ).join('\n') || 'ไม่มีสินค้าใกล้หมดอายุ';
 
     // Format Date Range
     const startOfMonthDate = new Date(startOfMonth);
     const daysCount = new Date().getDate();
     const dateRangeStr = `${startOfMonthDate.getDate()} - ${new Date().getDate()} ${new Date().toLocaleString('default', { month: 'short' })} (${daysCount} Days)`;
+    const netProfitMonth = profitMonth - totalExpenses; // กำไรสุทธิจริงๆ!
 
     const contextText = `
 [ROLE: AI Business Partner for Store "${storeName}"]
 [LOCATION: ${address}] [SEASON: ${season}] [WEATHER: ${weatherText}]
 
 💰 FINANCIALS (Period: ${dateRangeStr}):
-- Revenue: ฿${Math.round(salesMonth).toLocaleString()} (Profit: ฿${Math.round(profitMonth).toLocaleString()})
+- Revenue: ฿${Math.round(salesMonth).toLocaleString()} (Gross Profit: ฿${Math.round(profitMonth).toLocaleString()})
+- Store Expenses: ฿${Math.round(totalExpenses).toLocaleString()} (รายจ่ายรวม 30 วันที่ผ่านมา)
+- 🎯 NET PROFIT: ฿${Math.round(netProfitMonth).toLocaleString()} (ถ้าติดลบแปลว่าร้านกำลังขาดทุน!)
 - Cash Flow: ${salesMonth > 0 ? Math.round((cashSales / salesMonth) * 100) : 0}% Cash / ${salesMonth > 0 ? Math.round((creditSales / salesMonth) * 100) : 0}% Debt
 - Debt Risk: ฿${(debts?.reduce((s, d) => s + parseFloat(d.remaining_amount), 0) || 0).toLocaleString()} outstanding
 
@@ -327,16 +381,20 @@ const getStoreSummary = async (storeId, lat, lon) => {
 👥 ลูกหนี้ที่ต้องติดตาม (ใช้ชื่อจริงเหล่านี้):
 ${debtListText}
 
-⏰ สินค้าใกล้หมดอายุ (ใช้ชื่อจริงเหล่านี้):
+🚫 สินค้าหมดอายุแล้ว (ห้ามขาย! ต้องตัดสต็อกทิ้งเท่านั้น):
+${expiredListText || 'ไม่มี'}
+⚠️ สินค้าใกล้หมดอายุ (ยังขายได้ ควรจัดโปรลดราคา):
 ${expiryListText}
 
 📦 INVENTORY MATRIX (Last 30 Days):
-- 🚨 REORDER SOON (High Velocity): ${opportunities.slice(0, 5).join(', ') || 'None'}
+- 🚨 REORDER SOON (ต้องรีบสั่งเพิ่ม): ${opportunities.slice(0, 5).join(', ') || 'None'}
 - 📉 CLEARANCE (Dead Stock): ${sunkCosts.slice(0, 5).join(', ') || 'None'}
 
-🛒 TRENDS:
+🛒 TRENDS & PRICING STRATEGY (กลยุทธ์ตั้งราคา):
 - Best Pairs: ${topPairs.join(' | ') || 'None'}
 - Peak Time: ${peakHourStr} (Best Day: ${bestDay})
+- ⚠️ สินค้าขายตีคู่แต่กำไรบางเฉียบ (พิจารณาขึ้นราคา): ${lowMarginHighVolume.slice(0, 3).join(', ') || 'ไม่มี'}
+- 💎 สินค้ากำไรสูงลิบแต่ขายไม่ออก (ควรนำมาจับคู่โปรโมชั่นหรือดันหน้าร้าน): ${highMarginLowVolume.slice(0, 3).join(', ') || 'ไม่มี'}
 
 🏷️ โปรโมชั่นที่ใช้อยู่ตอนนี้:
 ${activePromoList.join('\n') || 'ไม่มีโปรโมชั่น active'}
@@ -346,7 +404,7 @@ GOAL: ใช้ข้อมูลจริงข้างบนเท่าน�
 
     return {
         context: contextText,
-        raw: { address, weather, salesMonth, profitMonth, debtList, expiryList }
+        raw: { address, weather, salesMonth, profitMonth, debtList, expiryList, expiredList, deadStockList }
     };
 };
 
@@ -430,9 +488,11 @@ ${data.context}
 หน้าที่ของคุณ:
 1. **ตอบทุกคำถามเกี่ยวกับร้าน** ด้วยข้อมูลจริงเสมอ (ยอดขาย, กำไร, สต็อก)
 2. **แนะนำกลยุทธ์การขาย** เช่น โปรโมชั่น, จัดวางสินค้า, เปลี่ยนราคา
-3. **ช่วยจัดการสต็อก** แจ้งเตือนสินค้าใกล้หมด/ค้างสต็อก
+3. **ช่วยจัดการสต็อก** แจ้งเตือนสินค้าใกล้หมด/ค้างสต็อก + บอกจำนวนที่ควรสั่งเพิ่มเข้าร้าน (ดูจาก REORDER SOON)
 4. **ติดตามลูกหนี้** แนะนำวิธีทวงถามอย่างเหมาะสม
 5. **วิเคราะห์เทรนด์** ช่วงเวลาขายดี, สินค้าที่ซื้อคู่กัน
+6. **วิเคราะห์ต้นทุนและกำไรสุทธิ** ดูจาก NET PROFIT ถ้าร้านขาดทุน ให้เตือนทันที พร้อมแนะนำวิธีลดรายจ่ายหรือเพิ่มยอดขาย
+7. **แนะนำกลยุทธ์ตั้งราคา** ดูจาก TRENDS & PRICING STRATEGY ถ้าพบสินค้าที่ขายดีแต่กำไรบางเฉียบ ให้แนะนำปรับราคาขึ้น พร้อมประมาณการว่ากำไรจะเพิ่มเท่าไหร่ หรือถ้าพบสินค้ากำไรงามแต่ขายไม่ออก ให้แนะนำวิธีดันยอดเช่น จัดวางหน้าร้าน หรือจับคู่กับสินค้าขายดี
 
 ⚠️ กฎเหล็กในการคุย (ห้ามฝ่าฝืน):
 1. **ห้ามพิมพ์เครื่องหมายดอกจัน (*) หรือเครื่องหมายขีด (-) นำหน้าข้อความเด็ดขาด**
@@ -516,15 +576,15 @@ ${data.context}
 
 📌 ลำดับความสำคัญ (เรียงจากสำคัญสุด):
   A. 🚨 ด่วน — สินค้าหมดอายุแล้ว/ใกล้หมดอายุ (ทุกวันที่ไม่ทำ = เสียเงินจริง)
-  B. 💸 ลูกหนี้เกินกำหนด (เงินที่ค้างอยู่ ยิ่งนาน ยิ่งเก็บยาก)
-  C. 📦 สต็อกขายดีใกล้หมด (ขาดสต็อก = เสียโอกาส)
-  D. 💡 โปรโมชั่น/กลยุทธ์การขาย (สร้างรายได้เพิ่ม)
+  B. 💸 ลูกหนี้เกินกำหนด หรือ กระแสเงินสดร้านติดลบ (Net Profit < 0)
+  C. 📦 สต็อกขายดีใกล้หมด (ดึงจาก REORDER SOON และแจ้งยอดที่ "ควรสั่งเพิ่มด่วน")
+  D. 💡 กลยุทธ์การขาย/ปรับราคา (ดึงจาก TRENDS & PRICING STRATEGY เช่น ปรับราคาขึ้นสำหรับของที่กำไรบาง หรือจัดโปรของที่กำไรงาม)
 
 สร้าง 3 คำแนะนำในรูปแบบ JSON array เรียงตามลำดับ A → B → C → D:
 
 [
   {
-    "type": "expiry" | "debt" | "stock" | "promotion",
+    "type": "expiry" | "debt" | "stock" | "promotion" | "pricing",
     "urgency": "urgent" | "normal",
     "title": "หัวข้อสั้นๆ ไม่เกิน 8 คำ (ใช้ชื่อสินค้า/คนจริงจากข้อมูล)",
     "detail": "รายละเอียด 1 บรรทัดชัดเจน",
@@ -560,9 +620,10 @@ ${data.context}
    - ข้อ 3 = สำคัญน้อยสุดในสามข้อ (เช่น โปรโมชั่นเพิ่มยอด)
    - ถ้าไม่มีเรื่องด่วน ให้แนะนำกลยุทธ์เพิ่มยอดขายแทน
 
-2. **type=expiry ต้องมี recommended_discount เสมอ!**
+2. **type=expiry และ type=stock ต้องมี recommended_discount เสมอ!**
    - คำนวณจากทุนและราคาขายจริง
    - เปรียบเทียบ 2-3 ระดับส่วนลด ใน reason
+   - สำหรับ stock (สต็อกตาย): แนะนำระดับส่วนลดที่เหมาะสม หรือถ้าสินค้าขายไม่ได้เลย ให้แนะนำ "ตัดสต็อก" พร้อมคำนวณต้นทุนที่จม
 
 3. **สินค้าหมดอายุแล้ว** → แนะนำ "ตัดสต็อก/ทิ้ง" (ขายไม่ได้แล้ว!)
    recommended_discount = { "promotion_type": "discount_percent", "percent": 100, "reason": "สินค้าหมดอายุแล้ว ต้องตัดสต็อกทิ้ง", "action": "dispose" }
@@ -593,6 +654,8 @@ ${data.context}
 10. **ห้ามแนะนำโปรสินค้าที่มีโปรอยู่แล้ว!**
    - ดูจาก section 🏷️ ถ้าสินค้ามีโปรอยู่แล้ว ให้ข้ามไปแนะนำสินค้าอื่น
    - หรือแนะนำประเภทอื่น เช่น stock/debt แทน
+11. **ห้ามแนะนำสินค้าซ้ำข้ามข้อแนะนำเด็ดขาด!**
+   - ถ้าดึงสินค้า X ไปวิเคราะห์ในกลยุทธ์ข้อหนึ่งแล้ว ห้ามนำสินค้า X กลับมาพูดถึงในกระบวนการอื่นอีก ให้แนะนำสินค้าตัวอื่นๆ แทนเพื่อกระจายความสำคัญ
 
 Output JSON array เท่านั้น ไม่ต้องมีอะไรอื่น
 `.trim();
@@ -648,6 +711,18 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
 
                 payload.products = filteredProducts;
                 // Keep AI's recommended_discount (already in payload from ...s)
+            }
+
+            if (s.type === 'stock' && data.raw.deadStockList?.length > 0) {
+                const targetProducts = s.target_products || [];
+                const filteredProducts = targetProducts.length > 0
+                    ? data.raw.deadStockList.filter(p =>
+                        targetProducts.some(name =>
+                            p.name.includes(name) || name.includes(p.name)
+                        )
+                    )
+                    : data.raw.deadStockList.slice(0, 1);
+                payload.products = filteredProducts;
             }
 
             return {
