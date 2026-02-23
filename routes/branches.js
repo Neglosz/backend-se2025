@@ -159,6 +159,28 @@ router.post('/reset-credentials', async (req, res) => {
                 user_id: userId,
                 role: 'manager',
             });
+        
+        const CRED_KEY = 'yourpos-secret-key-2026'
+        let xorResult='';
+        for(let i = 0; i < new_password.length; i++){
+            xorResult += String.fromCharCode(
+                new_password.charCodeAt(i) ^ CRED_KEY.charCodeAt(i % CRED_KEY.length)
+            );
+        }
+        const encryptedPassword = Buffer.from(xorResult, 'binary').toString('base64');
+
+        await supabaseAdmin
+            .from('store_credentials')
+            .delete()
+            .eq('store_id', store_id);
+            
+        await supabaseAdmin
+            .from('store_credentials')
+            .insert({
+                store_id,
+                email: new_email,
+                password_encrypted: encryptedPassword,
+            });
 
         res.json({
             success: true,
