@@ -24,9 +24,10 @@ const registerStockRoutes = ({
                 .eq('store_id', storeId);
 
             // Count batches expiring within 30 days
-            const thirtyDaysFromNow = new Date();
+            const thirtyDaysFromNow = new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
             thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
-            const today = new Date().toISOString().split('T')[0];
+            const nowTh = new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
+            const today = nowTh.toISOString().split('T')[0];
             const expireLimit = thirtyDaysFromNow.toISOString().split('T')[0];
 
             const { data: nearExpiryBatches } = await supabaseAdmin
@@ -108,7 +109,8 @@ const registerStockRoutes = ({
                 return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
             }
 
-            const today = new Date().toISOString().split('T')[0];
+            const nowTh = new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
+            const today = nowTh.toISOString().split('T')[0];
 
             const { data, error } = await supabaseAdmin
                 .from('product_batches')
@@ -204,9 +206,10 @@ const registerStockRoutes = ({
                 return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
             }
 
-            const thirtyDaysFromNow = new Date();
+            const thirtyDaysFromNow = new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
             thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
-            const today = new Date().toISOString().split('T')[0];
+            const nowTh = new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
+            const today = nowTh.toISOString().split('T')[0];
             const expireLimit = thirtyDaysFromNow.toISOString().split('T')[0];
 
             const { data, error } = await supabaseAdmin
