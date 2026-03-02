@@ -30,7 +30,8 @@ const registerProductRoutes = ({
                 .from('products')
                 .select('id, barcode, name, price, cost_price, stock_qty, image_url, category_id, is_weightable, unit_type')
                 .order('name', { ascending: true })
-                .eq('store_id', storeId);
+                .eq('store_id', storeId)
+                .is('deleted_at', null);
 
             // Filter by Type
             if (type === 'normal') {
@@ -148,7 +149,8 @@ const registerProductRoutes = ({
                 product_categories(id, name)
             `)
                 .eq('barcode', barcode)
-                .eq('store_id', storeId);
+                .eq('store_id', storeId)
+                .is('deleted_at', null);
 
             const { data, error } = await query.single();
 
@@ -416,6 +418,7 @@ const registerProductRoutes = ({
                 .from('products')
                 .select('id')
                 .eq('category_id', id)
+                .is('deleted_at', null)
                 .limit(1);
 
             if (products && products.length > 0) {

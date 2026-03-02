@@ -159,10 +159,10 @@ router.post('/reset-credentials', async (req, res) => {
                 user_id: userId,
                 role: 'manager',
             });
-        
+
         const CRED_KEY = 'yourpos-secret-key-2026'
-        let xorResult='';
-        for(let i = 0; i < new_password.length; i++){
+        let xorResult = '';
+        for (let i = 0; i < new_password.length; i++) {
             xorResult += String.fromCharCode(
                 new_password.charCodeAt(i) ^ CRED_KEY.charCodeAt(i % CRED_KEY.length)
             );
@@ -173,7 +173,7 @@ router.post('/reset-credentials', async (req, res) => {
             .from('store_credentials')
             .delete()
             .eq('store_id', store_id);
-            
+
         await supabaseAdmin
             .from('store_credentials')
             .insert({
@@ -376,7 +376,8 @@ router.delete('/delete', async (req, res) => {
         const { data: products } = await supabaseAdmin
             .from('products')
             .select('id')
-            .eq('store_id', store_id);
+            .eq('store_id', store_id)
+            .is('deleted_at', null);
 
         if (products && products.length > 0) {
             const productIds = products.map(p => p.id);
@@ -424,7 +425,8 @@ router.delete('/delete', async (req, res) => {
         await supabaseAdmin
             .from('products')
             .delete()
-            .eq('store_id', store_id);
+            .eq('store_id', store_id)
+            .is('deleted_at', null);
 
         // 21. Delete product_categories
         await supabaseAdmin

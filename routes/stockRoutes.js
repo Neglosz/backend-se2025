@@ -21,7 +21,8 @@ const registerStockRoutes = ({
             const { count: totalProducts } = await supabaseAdmin
                 .from('products')
                 .select('*', { count: 'exact', head: true })
-                .eq('store_id', storeId);
+                .eq('store_id', storeId)
+                .is('deleted_at', null);
 
             // Count batches expiring within 30 days
             const thirtyDaysFromNow = new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
@@ -58,6 +59,7 @@ const registerStockRoutes = ({
                 .select('id')
                 .eq('store_id', storeId)
                 .gt('low_stock_threshold', 0)
+                .is('deleted_at', null)
                 .filter('stock_qty', 'lte', 'low_stock_threshold');
 
             // Count out of stock products
@@ -65,7 +67,8 @@ const registerStockRoutes = ({
                 .from('products')
                 .select('*', { count: 'exact', head: true })
                 .eq('store_id', storeId)
-                .eq('stock_qty', 0);
+                .eq('stock_qty', 0)
+                .is('deleted_at', null);
 
             // Alternative query for low stock (RPC might be needed for complex comparison)
             // For now, fetch and filter in JS
@@ -73,7 +76,8 @@ const registerStockRoutes = ({
                 .from('products')
                 .select('id, stock_qty, low_stock_threshold')
                 .eq('store_id', storeId)
-                .gt('low_stock_threshold', 0);
+                .gt('low_stock_threshold', 0)
+                .is('deleted_at', null);
 
             const lowStockCount = allProducts?.filter(p =>
                 parseFloat(p.stock_qty) <= parseFloat(p.low_stock_threshold) && parseFloat(p.stock_qty) > 0
@@ -172,6 +176,7 @@ const registerStockRoutes = ({
                 .select('id, name, stock_qty, image_url, unit_type')
                 .eq('store_id', storeId)
                 .eq('stock_qty', 0)
+                .is('deleted_at', null)
                 .order('name', { ascending: true })
                 .limit(20);
 
@@ -274,6 +279,7 @@ const registerStockRoutes = ({
                 .select('id, name, stock_qty, low_stock_threshold, image_url, unit_type')
                 .eq('store_id', storeId)
                 .gt('low_stock_threshold', 0)
+                .is('deleted_at', null)
                 .order('stock_qty', { ascending: true })
                 .limit(20);
 
@@ -426,7 +432,8 @@ const registerStockRoutes = ({
                 .from('products')
                 .select('id, name, stock_qty')
                 .eq('store_id', storeId)
-                .eq('stock_qty', 0);
+                .eq('stock_qty', 0)
+                .is('deleted_at', null);
 
             for (const product of outOfStockProducts || []) {
                 notifications.push({
@@ -445,7 +452,8 @@ const registerStockRoutes = ({
                 .select('id, name, stock_qty, low_stock_threshold')
                 .eq('store_id', storeId)
                 .gt('low_stock_threshold', 0)
-                .gt('stock_qty', 0);
+                .gt('stock_qty', 0)
+                .is('deleted_at', null);
 
             for (const product of lowStockProducts || []) {
                 if (parseFloat(product.stock_qty) <= parseFloat(product.low_stock_threshold)) {
