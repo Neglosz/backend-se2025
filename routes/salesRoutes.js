@@ -1,3 +1,11 @@
+function getUnitMultiplier(unitTypeOrCode) {
+    const u = (unitTypeOrCode || '').toLowerCase();
+    if (u === 'g' || u === 'กรัม') return 0.001;
+    if (u === 'h' || u === 'ขีด') return 0.1;
+    if (u === 'kg' || u === 'กิโลกรัม') return 1;
+    return 1;
+}
+
 const registerSalesRoutes = ({
     app,
     supabaseAdmin,
@@ -47,20 +55,28 @@ const registerSalesRoutes = ({
             const orderItems = [];
 
             for (const item of items) {
-                // 1. Determine Unit & Conversion
-                // If unit_code is present (weighted item), use it to convert to base unit (kg) for stock
-                // If not (normal item), use 1:1
                 const unitCode = item.unit_code;
-                const unitLabel = item.unit || item.unit_type || 'ชิ้น'; // Fallback to 'ชิ้น'
-
-                let conversion = 1;
-                if (unitCode === 'g') conversion = 0.001;
-                else if (unitCode === 'h') conversion = 0.1;
-                // else default 1 (kg or pieces)
-
-                let qtyToDeduct = parseFloat(item.quantity) * conversion;
-                const productId = item.product_id || item.id; // product_id for weight items, id for normal
-                const price = parseFloat(item.price); // This is price per UNIT (e.g. per gram)
+                const unitLabel = item.unit || item.unit_type || 'ชิ้น';
+                const productId = item.product_id || item.id;
+                const price = parseFloat(item.price);
+                // ดึงข้อมูลสินค้าก่อน (ต้องรู้ unit_type เพื่อแปลงหน่วย)
+                const { data: product } = await supabaseAdmin
+                    .from('products')
+                    .select('stock_qty, low_stock_threshold, name, unit_type')
+                    .eq('id', productId)
+                    .single();
+                // แปลงจำนวนขาย → หน่วยของสินค้า
+                const saleMultiplier = getUnitMultiplier(unitCode);
+                const productMultiplier = getUnitMultiplier(product?.unit_type);
+                let qtyToDeduct = (parseFloat(item.quantity) * saleMultiplier) / productMultiplier;
+                // ห้ามขายเกิน stock
+                const currentStock = parseFloat(product?.stock_qty || 0);
+                if (qtyToDeduct > currentStock && currentStock >= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `สต็อกไม่เพียงพอ: ${product?.name} มีเหลือ ${currentStock} ${product?.unit_type || 'ชิ้น'}`
+                    });
+                }
 
                 // 2.1 Get Product Batches (FIFO: Expiring First)
                 const { data: batches, error: batchFetchError } = await supabaseAdmin
@@ -121,7 +137,7 @@ const registerSalesRoutes = ({
 
                         // Insert Order Item (Split by batch)
                         // We need to convert deductAmount (KG) back to Item Unit (e.g. Grams) for the receipt/record
-                        const recordedQty = deductAmount / conversion;
+                        const recordedQty = (deductAmount * productMultiplier) / saleMultiplier;
                         const subtotal = recordedQty * price;
 
                         await supabaseAdmin.from('order_items').insert([{
@@ -142,7 +158,7 @@ const registerSalesRoutes = ({
 
                     // If still remaining (more sold than in batches), record the rest as null batch
                     if (remainingToFulfill > 0) {
-                        const recordedQty = remainingToFulfill / conversion;
+                        const recordedQty = (remainingToFulfill * productMultiplier) / saleMultiplier;
                         const subtotal = recordedQty * price;
                         await supabaseAdmin.from('order_items').insert([{
                             order_id: order.id,
@@ -160,13 +176,6 @@ const registerSalesRoutes = ({
                 }
 
                 // 2.3 Update Main Product Stock & Check for Notifications
-                const { data: product } = await supabaseAdmin
-                    .from('products')
-                    .select('stock_qty, low_stock_threshold, name')
-                    .eq('id', productId)
-                    .single();
-
-                const currentStock = parseFloat(product?.stock_qty || 0);
                 const threshold = parseFloat(product?.low_stock_threshold || 0);
                 const newStock = currentStock - qtyToDeduct;
 
@@ -441,17 +450,26 @@ const registerSalesRoutes = ({
             // --- Process Items & Deduct Stock (Copied from Normal Sale) ---
             if (items && items.length > 0) {
                 for (const item of items) {
-                    // 1. Determine Unit & Conversion (Same as Normal Sale)
                     const unitCode = item.unit_code;
                     const unitLabel = item.unit || item.unit_type || 'ชิ้น';
-
-                    let conversion = 1;
-                    if (unitCode === 'g') conversion = 0.001;
-                    else if (unitCode === 'h') conversion = 0.1;
-
-                    let qtyToDeduct = parseFloat(item.quantity) * conversion;
                     const productId = item.product_id || item.id;
                     const price = parseFloat(item.price);
+                    // ดึงข้อมูลสินค้า
+                    const { data: products } = await supabaseAdmin
+                        .from('products')
+                        .select('stock_qty, low_stock_threshold, name, unit_type')
+                        .eq('id', productId)
+                        .single();
+                    const saleMultiplier = getUnitMultiplier(unitCode);
+                    const productMultiplier = getUnitMultiplier(products?.unit_type);
+                    let qtyToDeduct = (parseFloat(item.quantity) * saleMultiplier) / productMultiplier;
+                    const currentStocks = parseFloat(products?.stock_qty || 0);
+                    if (qtyToDeduct > currentStocks && currentStocks >= 0) {
+                        return res.status(400).json({
+                            success: false,
+                            error: `สต็อกไม่เพียงพอ: ${products?.name} มีเหลือ ${currentStocks} ${products?.unit_type || 'ชิ้น'}`
+                        });
+                    }
 
                     // Get Product Batches (FIFO)
                     const { data: batches } = await supabaseAdmin
@@ -502,7 +520,7 @@ const registerSalesRoutes = ({
                             }]);
 
                             // Insert Order Item
-                            const recordedQty = deductAmount / conversion;
+                            const recordedQty = (deductAmount * productMultiplier) / saleMultiplier;
                             const subtotal = recordedQty * price;
 
                             await supabaseAdmin.from('order_items').insert([{
@@ -522,7 +540,7 @@ const registerSalesRoutes = ({
                         }
 
                         if (remainingToFulfill > 0) {
-                            const recordedQty = remainingToFulfill / conversion;
+                            const recordedQty = (remainingToFulfill * productMultiplier) / saleMultiplier;
                             const subtotal = recordedQty * price;
 
                             await supabaseAdmin.from('order_items').insert([{
@@ -540,12 +558,9 @@ const registerSalesRoutes = ({
                         }
                     }
 
-                    // Update Main Product Stock
-                    const { data: product } = await supabaseAdmin.from('products').select('stock_qty').eq('id', productId).single();
-                    const currentStock = parseFloat(product?.stock_qty || 0);
                     await supabaseAdmin
                         .from('products')
-                        .update({ stock_qty: currentStock - qtyToDeduct })
+                        .update({ stock_qty: currentStocks - qtyToDeduct })
                         .eq('id', productId);
                 }
             }
