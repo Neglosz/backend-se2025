@@ -90,7 +90,8 @@ const getStoreSummary = async (storeId, lat, lon) => {
     const { data: products } = await supabaseAdmin
         .from('products')
         .select('id, name, stock_qty, cost_price, price, low_stock_threshold')
-        .eq('store_id', storeId);
+        .eq('store_id', storeId)
+        .is('deleted_at', null);
 
     const today = new Date().toISOString().split('T')[0];
     const { data: activePromos } = await supabaseAdmin
@@ -113,7 +114,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
         .gt('remaining_qty', 0)
         .lt('expire_date', todayISO)        // หมดอายุแล้ว (< วันนี้)
         .order('expire_date', { ascending: true });
-    
+
     const { data: expenses } = await supabaseAdmin
         .from('account_transactions')
         .select('amount')
@@ -277,7 +278,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
 
     const opportunities = [], sunkCosts = [], winners = [];
     const deadStockList = [];
-    
+
     const lowMarginHighVolume = []; // ขายดีแต่กำไรบางเฉียบ
     const highMarginLowVolume = []; // กำไรงามแต่ขายไม่ออก
     products?.forEach(p => {
@@ -293,7 +294,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
             const orderText = suggestedOrder > 0 ? `ควรสั่งเพิ่มด่วน ${suggestedOrder} ชิ้น` : "ควรเติมสต็อก";
             opportunities.push(`${p.name} (ขายไป ${soldQty}, เหลือ ${p.stock_qty} | ⚠️ ${orderText})`);
         }
-        
+
         if (soldQty === 0 && p.stock_qty > 10) {
             sunkCosts.push(`${p.name} (Stock ${p.stock_qty}, 0 Sales)`);
             deadStockList.push({
@@ -958,6 +959,7 @@ router.post('/apply-promotion', async (req, res) => {
             .from('products')
             .select('id, name, price, cost_price')
             .eq('store_id', storeId)
+            .is('deleted_at', null)
             .or(productNames.map(n => `name.ilike.%${n}%`).join(','));
 
         if (productError) throw productError;
@@ -1110,6 +1112,7 @@ router.post('/dispose-product', async (req, res) => {
             .from('products')
             .select('id, name, stock_qty')
             .eq('store_id', storeId)
+            .is('deleted_at', null)
             .or(productNames.map(n => `name.ilike.%${n}%`).join(','));
 
         if (productError) throw productError;
@@ -1151,7 +1154,8 @@ router.post('/dispose-product', async (req, res) => {
                 await supabaseAdmin
                     .from('products')
                     .update({ stock_qty: Math.max(0, product.stock_qty - disposedQty) })
-                    .eq('id', product.id);
+                    .eq('id', product.id)
+                    .is('deleted_at', null);
 
                 disposedItems.push({
                     productName: product.name,
