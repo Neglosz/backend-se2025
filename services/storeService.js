@@ -26,25 +26,18 @@ const createStoreService = ({ supabaseAdmin }) => {
 
     async function signUrlIfNeeded(urlOrPath, bucket) {
         if (!urlOrPath) return null;
-        if (bucket !== 'customers') return urlOrPath; // Only sign customers for now as it is private
-
+        if (bucket !== 'customers') return urlOrPath;
         let path = urlOrPath;
         // Extract path if it's a full URL
         if (urlOrPath.includes(`/object/public/${bucket}/`)) {
             path = urlOrPath.split(`/object/public/${bucket}/`)[1];
         }
-
-        const { data, error } = await supabaseAdmin
+        // ✅ ของใหม่ (ดึง Public URL แทน)
+        const { data } = supabaseAdmin
             .storage
             .from(bucket)
-            .createSignedUrl(path, 3600); // 1 hour expiry
-
-        if (error) {
-            console.error(`Error signing URL for ${path}:`, error);
-            return urlOrPath; // Fallback to original
-        }
-
-        return data.signedUrl;
+            .getPublicUrl(path);
+        return data.publicUrl;
     }
 
     return {
