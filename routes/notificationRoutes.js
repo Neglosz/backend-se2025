@@ -351,6 +351,18 @@ const registerNotificationRoutes = ({
                 if (isNew) results.promoEnding++;
             }
 
+            // 5a. AUTO-DEACTIVATE EXPIRED PROMOS
+            const { data: expiredPromos } = await supabaseAdmin
+                .from('promotions')
+                .update({ is_active: false })
+                .eq('store_id', storeId)
+                .eq('is_active', true)
+                .lt('end_date', todayStr)
+                .select('id');
+            if (expiredPromos && expiredPromos.length > 0) {
+                results.cleaned += expiredPromos.length;
+            }
+
             // 6. AUTO-RESOLVE: Cleanup notifications for issues that are fixed
             // Get all active alerts for this store
             const { data: activeNotifs } = await supabaseAdmin
