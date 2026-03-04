@@ -89,7 +89,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     // B. Current Stock
     const { data: products } = await supabaseAdmin
         .from('products')
-        .select('id, name, stock_qty, cost_price, price, low_stock_threshold')
+        .select('id, name, stock_qty, cost_price, price, low_stock_threshold, unit_type')
         .eq('store_id', storeId)
         .is('deleted_at', null);
 
@@ -111,6 +111,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
         .from('product_batches')
         .select('remaining_qty, expire_date, products!inner(name, store_id, cost_price, price, unit_type)')
         .eq('products.store_id', storeId)
+        .is('products.deleted_at', null)
         .gt('remaining_qty', 0)
         .lt('expire_date', todayISO)        // หมดอายุแล้ว (< วันนี้)
         .order('expire_date', { ascending: true });
@@ -130,6 +131,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
         .from('product_batches')
         .select('remaining_qty, expire_date, products!inner(name, store_id, cost_price, price, unit_type)')
         .eq('products.store_id', storeId)
+        .is('products.deleted_at', null)
         .gt('remaining_qty', 0)
         .gte('expire_date', todayISO)                         // ยังไม่หมดอายุ (>= วันนี้)
         .lte('expire_date', fourteenDaysLater.toISOString())  // ภายใน 14 วัน
@@ -278,6 +280,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
 
     const opportunities = [], sunkCosts = [], winners = [];
     const deadStockList = [];
+    const reorderList = [];
 
     const lowMarginHighVolume = []; // ขายดีแต่กำไรบางเฉียบ
     const highMarginLowVolume = []; // กำไรงามแต่ขายไม่ออก
@@ -291,8 +294,17 @@ const getStoreSummary = async (storeId, lat, lon) => {
         if (soldQty > 10 && p.stock_qty <= threshold) {
             const dailySales = soldQty / 30;
             const suggestedOrder = Math.ceil((dailySales * 14) - p.stock_qty);
-            const orderText = suggestedOrder > 0 ? `ควรสั่งเพิ่มด่วน ${suggestedOrder} ชิ้น` : "ควรเติมสต็อก";
-            opportunities.push(`${p.name} (ขายไป ${soldQty}, เหลือ ${p.stock_qty} | ⚠️ ${orderText})`);
+            const unitLabel = p.unit_type || 'ชิ้น';
+            const orderText = suggestedOrder > 0 ? `ควรสั่งเพิ่มด่วน ${suggestedOrder} ${unitLabel}` : "ควรเติมสต็อก";
+            opportunities.push(`${p.name} (ขายไป ${soldQty}, เหลือ ${p.stock_qty} ${unitLabel} | ⚠️ ${orderText})`);
+            reorderList.push({
+                name: p.name,
+                qty: parseFloat(p.stock_qty) || 0,
+                unit: p.unit_type || 'ชิ้น',
+                costPrice: parseFloat(p.cost_price) || 0,
+                sellPrice: parseFloat(p.price) || 0,
+                suggestedOrder: suggestedOrder
+            });
         }
 
         if (soldQty === 0 && p.stock_qty > 10) {
@@ -310,7 +322,8 @@ const getStoreSummary = async (storeId, lat, lon) => {
         if (soldQty * margin > 1000) winners.push(p.name);
         // 3. ขายกระจุยแต่กำไรนิดเดียว (ต่ำกว่า 15%)
         if (soldQty > 15 && marginPercent < 15) {
-            lowMarginHighVolume.push(`${p.name} (ขายไป ${soldQty} ชิ้น แต่กำไรชิ้นละ ${marginPercent}%)`);
+            const unitLbl = p.unit_type || 'ชิ้น';
+            lowMarginHighVolume.push(`${p.name} (ขายไป ${soldQty} ${unitLbl} แต่กำไรต่อหน่วยละ ${marginPercent}%)`);
         }
     });
 
@@ -337,7 +350,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     const bestSellersRev = Object.values(productStatsMonth)
         .sort((a, b) => b.revenue - a.revenue)
         .slice(0, 5)
-        .map(p => `${p.name} (฿${p.revenue.toLocaleString()})`)
+        .map(p => `${p.name} (ยอดขายรวมทั้งเดือน ฿${p.revenue.toLocaleString()})`)
         .join(', ');
 
     // ===================================================
@@ -405,7 +418,7 @@ GOAL: ใช้ข้อมูลจริงข้างบนเท่าน�
 
     return {
         context: contextText,
-        raw: { address, weather, salesMonth, profitMonth, debtList, expiryList, expiredList, deadStockList }
+        raw: { address, weather, salesMonth, profitMonth, debtList, expiryList, expiredList, deadStockList, reorderList }
     };
 };
 
@@ -534,46 +547,68 @@ ${data.context}
     }
 });
 
-// GET /api/ai/recommendations - Get or Generate 3 daily recommendations
+// GET /api/ai/recommendations - Get or Generate 5 daily recommendations
 router.get('/recommendations', async (req, res) => {
     try {
         const storeId = req.headers['x-store-id'];
         const userId = req.headers['x-user-id'] || req.user?.id;
-        const { lat, lon } = req.query;
+        const { lat, lon, period = 'today' } = req.query;
 
         if (!storeId || !userId) return res.status(400).json({ success: false, error: 'Store and User ID required' });
 
-        // Use Thailand timezone (UTC+7) for "today" calculation
-        // This ensures recommendations reset at midnight Bangkok time, not UTC
-        const bangkokOffset = 7 * 60 * 60 * 1000; // 7 hours in milliseconds
-        const nowBangkok = new Date(Date.now() + bangkokOffset);
-        const todayBangkok = nowBangkok.toISOString().split('T')[0]; // YYYY-MM-DD in Bangkok time
+        let startDate = new Date();
+        startDate.setHours(0, 0, 0, 0);
+        if (period === 'today') {
+            // Use Thailand timezone (UTC+7) for "today" calculation
+            const bangkokOffset = 7 * 3600 * 1000;
+            const todayBangkok = new Date(Date.now() + bangkokOffset).toISOString().split('T')[0];
+            startDate = new Date(todayBangkok + 'T00:00:00+07:00');
+        } else if (period === 'month') {
+            startDate.setDate(1);
+        } else { // default to week
+            const day = startDate.getDay() || 7; // Get current day number, make Sunday (0) become 7
+            if (day !== 1) startDate.setHours(-24 * (day - 1)); // Adjust to previous Monday
+        }
 
-        // Calculate start of today in Bangkok time, then convert to UTC for database query
-        const startOfTodayBangkok = new Date(todayBangkok + 'T00:00:00+07:00');
-
-        // 1. Check if recommendations already generated today (Bangkok time)
+        // 1. Check if recommendations already generated for this period
         const { data: existing } = await supabaseAdmin
             .from('ai_recommendations')
             .select('*')
             .eq('store_id', storeId)
             .eq('user_id', userId)
-            .gte('created_at', startOfTodayBangkok.toISOString())
-            .order('created_at', { ascending: true })
-            .limit(3);
+            .gte('created_at', startDate.toISOString())
+            .order('created_at', { ascending: false })
+            .limit(5);
 
-        if (existing && existing.length >= 3) {
+        if (existing && existing.length > 0 && period !== 'today') {
+            // For historical periods, simply return what we found, do not re-generate.
+            return res.json({ success: true, data: existing, cached: true });
+        } else if (existing && existing.length >= 5 && period === 'today') {
+            // Today logic: if fully generated today, return cache
             return res.json({ success: true, data: existing, cached: true });
         }
 
-        // 2. Generate 3 New Recommendations using Gemini
+        // 1.5 FAST CHECK: Is the store empty?
+        // Do a lightweight check before running heavy queries and external APIs (Weather)
+        const { count: productCount } = await supabaseAdmin
+            .from('products')
+            .select('*', { count: 'exact', head: true })
+            .eq('store_id', storeId)
+            .is('deleted_at', null);
+
+        if (productCount === 0) {
+            return res.json({ success: true, data: [], emptyStore: true });
+        }
+
+        // 2. Generate 5 New Recommendations using Gemini
         const data = await getStoreSummary(storeId, lat, lon);
+
         const prompt = `
 ${data.context}
 
 คุณคือ "ผู้จัดการร้านมืออาชีพ" ที่เข้าใจร้านโชห่วยไทยอย่างลึกซึ้ง
 คุณรู้ทุกอย่างเกี่ยวกับร้านนี้ — ยอดขาย สต็อก ลูกหนี้ สินค้าใกล้หมดอายุ สภาพอากาศ ฤดูกาล
-หน้าที่ของคุณคือ ให้คำแนะนำ 3 ข้อที่ส่งผลกระทบต่อรายได้ร้านมากที่สุด
+หน้าที่ของคุณคือ ให้คำแนะนำ 5 ข้อที่ส่งผลกระทบต่อรายได้ร้านมากที่สุด
 
 📌 ลำดับความสำคัญ (เรียงจากสำคัญสุด):
   A. 🚨 ด่วน — สินค้าหมดอายุแล้ว/ใกล้หมดอายุ (ทุกวันที่ไม่ทำ = เสียเงินจริง)
@@ -581,7 +616,7 @@ ${data.context}
   C. 📦 สต็อกขายดีใกล้หมด (ดึงจาก REORDER SOON และแจ้งยอดที่ "ควรสั่งเพิ่มด่วน")
   D. 💡 กลยุทธ์การขาย/ปรับราคา (ดึงจาก TRENDS & PRICING STRATEGY เช่น ปรับราคาขึ้นสำหรับของที่กำไรบาง หรือจัดโปรของที่กำไรงาม)
 
-สร้าง 3 คำแนะนำในรูปแบบ JSON array เรียงตามลำดับ A → B → C → D:
+สร้าง 5 คำแนะนำในรูปแบบ JSON array เรียงตามลำดับ A → B → C → D:
 
 [
   {
@@ -597,7 +632,7 @@ ${data.context}
     "target_customers": ["ชื่อลูกหนี้ - เฉพาะ type=debt"],
     "target_products": ["ชื่อสินค้า - เฉพาะ type=expiry/stock/promotion"],
 
-    "recommended_discount": {
+    "recommended_discount": { // ใส่ null เท่านั้น ถ้าเป็นการแนะนำ "เติมสต็อก" ของขายดี หรือ ตัดสต็อก
       "promotion_type": "discount_percent" | "buy_x_get_y" | "bundle",
       "percent": 20,
       "discount_amount": 10,
@@ -618,13 +653,13 @@ ${data.context}
 
 1. **เรียงตามลำดับความสำคัญ**:
    - ข้อ 1 = สำคัญที่สุด ต้องทำก่อน (เช่น สินค้าหมดอายุแล้ว)
-   - ข้อ 3 = สำคัญน้อยสุดในสามข้อ (เช่น โปรโมชั่นเพิ่มยอด)
+   - ข้อ 5 = สำคัญน้อยสุดในห้าข้อ (เช่น โปรโมชั่นเพิ่มยอด)
    - ถ้าไม่มีเรื่องด่วน ให้แนะนำกลยุทธ์เพิ่มยอดขายแทน
 
-2. **type=expiry และ type=stock ต้องมี recommended_discount เสมอ!**
+2. **type=expiry และ type=stock (เฉพาะสต็อกจม/ขายไม่ออก) ต้องมี recommended_discount เสมอ!**
    - คำนวณจากทุนและราคาขายจริง
    - เปรียบเทียบ 2-3 ระดับส่วนลด ใน reason
-   - สำหรับ stock (สต็อกตาย): แนะนำระดับส่วนลดที่เหมาะสม หรือถ้าสินค้าขายไม่ได้เลย ให้แนะนำ "ตัดสต็อก" พร้อมคำนวณต้นทุนที่จม
+   - **ข้อยกเว้น**: ถ้าเป็น type=stock แบบ "ของขายดีต้องเติมสต็อก (REORDER SOON)" **ห้ามใส่ recommended_discount เด็ดขาด ทิ้งเป็น null ไปเลย** อย่ากุโปรโมชั่นขึ้นมาเอง
 
 3. **สินค้าหมดอายุแล้ว** → แนะนำ "ตัดสต็อก/ทิ้ง" (ขายไม่ได้แล้ว!)
    recommended_discount = { "promotion_type": "discount_percent", "percent": 100, "reason": "สินค้าหมดอายุแล้ว ต้องตัดสต็อกทิ้ง", "action": "dispose" }
@@ -637,9 +672,14 @@ ${data.context}
    - ถ้าข้อมูลเขียนว่า "OISHI" ต้องเขียน "OISHI" ไม่ใช่ "โออิชิ"
 
 6. **reason ต้องมีโครงสร้างชัดเจน แยกเป็นข้อๆ**:
-   "1. สถานการณ์: [อธิบายว่าเกิดอะไรขึ้น เช่น สินค้า X เหลือ 20 ชิ้น หมดอายุอีก 3 วัน]\n2. คำนวณ: [ถ้าทิ้ง = เสีย ฿xx / ถ้าลดราคา xx% = คืนทุน ฿yy]\n3. สรุป: [แนะนำทำอะไร เพราะอะไร]"
+   "1. สถานการณ์: [อธิบายว่าเกิดอะไรขึ้น เช่น สินค้า X เหลือ 20 ชิ้น หมดอายุอีก 3 วัน]\n2. คำนวณ: [ถ้าทิ้ง = เสีย ฿xx / ถ้าลดราคา xx% = คืนทุน ฿yy หรือ ถ้าสั่งเพิ่ม xx ชิ้น = อิงจากราคาขาย]\n3. สรุป: [แนะนำทำอะไร เพราะอะไร]"
 
-7. **type=promotion** (ใช้เมื่อไม่มีเรื่องด่วน):
+7. **คณิตศาสตร์ต้องถูกต้อง (Expected Impact)**:
+   - "ยอดขายรวมทั้งเดือน (Revenue)" ≠ "ราคาขายแต่ละชิ้น (Sell Price)" ห้ามสับสน
+   - เวลาคำนวณ expected_impact แบบได้รายได้จากการสั่งเพิ่ม ให้ใช้สูตร "ยอดสั่งเพิ่ม x ราคาขายแต่ละชิ้น (Sell Price)" เสมอ
+   - อย่าเอา Revenue ทั้งเดือนมาคูณจำนวนชิ้น!
+
+8. **type=promotion** (ใช้เมื่อไม่มีเรื่องด่วน):
    - แนะนำโปรโมชั่นจากโลกจริงที่เหมาะกับร้าน เช่น:
      • ซื้อคู่ลดราคา (จากสินค้า Best Pairs)
      • โปรช่วงเวลา Peak Hours
@@ -647,16 +687,16 @@ ${data.context}
      • เพิ่มสต็อกสินค้ายอดนิยมก่อนหมด
    - ต้องอ้างอิงข้อมูลจริง เช่น "สินค้า A ขายคู่กับ B บ่อย ควรจัดโปร bundle"
 
-8. **สต็อกเยอะมาก/ขายไม่ออกนาน** → พิจารณา "buy_x_get_y" (จูงใจกว่าลดราคา)
-9. **days_valid** กำหนดตามประเภท:
-   - type=expiry → 1-3 วัน (เร่งขาย)
-   - type=promotion/bundle → 5-14 วัน (ให้เวลาลูกค้า)
-   - type=stock → 7 วัน
-10. **ห้ามแนะนำโปรสินค้าที่มีโปรอยู่แล้ว!**
-   - ดูจาก section 🏷️ ถ้าสินค้ามีโปรอยู่แล้ว ให้ข้ามไปแนะนำสินค้าอื่น
-   - หรือแนะนำประเภทอื่น เช่น stock/debt แทน
-11. **ห้ามแนะนำสินค้าซ้ำข้ามข้อแนะนำเด็ดขาด!**
-   - ถ้าดึงสินค้า X ไปวิเคราะห์ในกลยุทธ์ข้อหนึ่งแล้ว ห้ามนำสินค้า X กลับมาพูดถึงในกระบวนการอื่นอีก ให้แนะนำสินค้าตัวอื่นๆ แทนเพื่อกระจายความสำคัญ
+9. **สต็อกเยอะมาก/ขายไม่ออกนาน** → พิจารณา "buy_x_get_y" (จูงใจกว่าลดราคา)
+10. **days_valid** กำหนดตามประเภท:
+    - type=expiry → 1-3 วัน (เร่งขาย)
+    - type=promotion/bundle → 5-14 วัน (ให้เวลาลูกค้า)
+    - type=stock (ระบายสต็อก) → 7 วัน
+11. **ห้ามแนะนำโปรสินค้าที่มีโปรอยู่แล้ว!**
+    - ดูจาก section 🏷️ ถ้าสินค้ามีโปรอยู่แล้ว ให้ข้ามไปแนะนำสินค้าอื่น
+    - หรือแนะนำประเภทอื่น เช่น stock/debt แทน
+12. **ห้ามแนะนำสินค้าซ้ำข้ามข้อแนะนำเด็ดขาด!**
+    - ถ้าดึงสินค้า X ไปวิเคราะห์ในกลยุทธ์ข้อหนึ่งแล้ว ห้ามนำสินค้า X กลับมาพูดถึงในกระบวนการอื่นอีก ให้แนะนำสินค้าตัวอื่นๆ แทนเพื่อกระจายความสำคัญ
 
 Output JSON array เท่านั้น ไม่ต้องมีอะไรอื่น
 `.trim();
@@ -676,7 +716,7 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
 
         // 3. Save to ai_recommendations table
         // Inject real data into payload based on type
-        const toInsert = suggestions.slice(0, 3).map(s => {
+        const toInsert = suggestions.slice(0, 5).map(s => {
             const payload = { ...s };
 
             // For debt type, inject ONLY customers mentioned by AI (target_customers)
@@ -714,15 +754,20 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                 // Keep AI's recommended_discount (already in payload from ...s)
             }
 
-            if (s.type === 'stock' && data.raw.deadStockList?.length > 0) {
+            if (s.type === 'stock') {
                 const targetProducts = s.target_products || [];
+                // ถ้า action_label เป็น เติมสต็อก → ดึงจาก reorderList, ไม่งั้นดึงจาก deadStockList
+                const sourceList = s.action_label === 'เติมสต็อก'
+                    ? (data.raw.reorderList || [])
+                    : (data.raw.deadStockList || []);
+
                 const filteredProducts = targetProducts.length > 0
-                    ? data.raw.deadStockList.filter(p =>
+                    ? sourceList.filter(p =>
                         targetProducts.some(name =>
                             p.name.includes(name) || name.includes(p.name)
                         )
                     )
-                    : data.raw.deadStockList.slice(0, 1);
+                    : sourceList.slice(0, 1);
                 payload.products = filteredProducts;
             }
 
@@ -781,6 +826,54 @@ router.post('/recommendations/:id/action', async (req, res) => {
         if (actual_outcome) updateData.actual_outcome = actual_outcome;
         if (actual_amount !== undefined) updateData.actual_amount = actual_amount;
 
+        // --- ENRICH PAYLOAD FOR REAL DATA TRACKING (Production-Level Metric) ---
+        if (action === 'accepted') {
+            const { data: rec } = await supabaseAdmin
+                .from('ai_recommendations')
+                .select('payload')
+                .eq('id', id)
+                .single();
+
+            if (rec && rec.payload) {
+                let enrichedPayload = { ...rec.payload };
+                let payloadUpdated = false;
+
+                // 1. Tag Products
+                if (rec.payload.target_products && Array.isArray(rec.payload.target_products) && rec.payload.target_products.length > 0) {
+                    const { data: products } = await supabaseAdmin
+                        .from('products')
+                        .select('id')
+                        .eq('store_id', storeId)
+                        .is('deleted_at', null)
+                        .or(rec.payload.target_products.map(n => `name.ilike."%${n.replace(/"/g, '""')}%"`).join(','));
+
+                    if (products && products.length > 0) {
+                        enrichedPayload.affected_product_ids = products.map(p => p.id);
+                        payloadUpdated = true;
+                    }
+                }
+
+                // 2. Tag Customers
+                if (rec.payload.target_customers && Array.isArray(rec.payload.target_customers) && rec.payload.target_customers.length > 0) {
+                    const { data: customers } = await supabaseAdmin
+                        .from('customers')
+                        .select('id')
+                        .eq('store_id', storeId)
+                        .or(rec.payload.target_customers.map(n => `name.ilike."%${n.replace(/"/g, '""')}%"`).join(','));
+
+                    if (customers && customers.length > 0) {
+                        enrichedPayload.affected_customer_ids = customers.map(c => c.id);
+                        payloadUpdated = true;
+                    }
+                }
+
+                if (payloadUpdated) {
+                    updateData.payload = enrichedPayload;
+                }
+            }
+        }
+        // ------------------------------------------------------------------------
+
         const { data, error } = await supabaseAdmin
             .from('ai_recommendations')
             .update(updateData)
@@ -823,18 +916,22 @@ router.get('/recommendations/history', async (req, res) => {
 
         if (error) throw error;
 
+        await syncRealMoneyEarned(storeId, data);
+
         // Group by date
         const grouped = {};
-        const today = new Date().toISOString().split('T')[0];
-        const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+        const todayBangkokOffset = new Date().getTime() + (7 * 3600 * 1000);
+        const today = new Date(todayBangkokOffset).toISOString().split('T')[0];
+        const yesterday = new Date(todayBangkokOffset - 86400000).toISOString().split('T')[0];
 
         data.forEach(item => {
-            const date = item.created_at.split('T')[0];
+            const itemDate = new Date(new Date(item.created_at).getTime() + (7 * 3600 * 1000));
+            const date = itemDate.toISOString().split('T')[0];
             let label = date;
             if (date === today) label = 'วันนี้';
             else if (date === yesterday) label = 'เมื่อวาน';
             else {
-                const diff = Math.floor((Date.now() - new Date(date).getTime()) / 86400000);
+                const diff = Math.floor((new Date(today).getTime() - new Date(date).getTime()) / 86400000);
                 label = `${diff} วันก่อน`;
             }
 
@@ -850,48 +947,115 @@ router.get('/recommendations/history', async (req, res) => {
     }
 });
 
+// --- HELPER TO SYNC ACTUAL REVENUE ---
+async function syncRealMoneyEarned(storeId, items) {
+    if (!items || items.length === 0) return items;
+    const acceptedItems = items.filter(r => r.status === 'accepted' && r.acted_at && r.payload);
+
+    for (const item of acceptedItems) {
+        let newAmount = 0;
+
+        // 1. Calculate Product Sales generated since accepted
+        if (item.payload.affected_product_ids && item.payload.affected_product_ids.length > 0) {
+            const { data: sales, error: salesError } = await supabaseAdmin
+                .from('order_items')
+                .select('subtotal, orders!inner(created_at, payment_status)')
+                .in('product_id', item.payload.affected_product_ids)
+                .eq('orders.store_id', storeId)
+                .eq('orders.payment_status', 'paid')
+                .gte('orders.created_at', item.acted_at);
+
+            if (!salesError && sales) {
+                newAmount += sales.reduce((sum, row) => sum + (parseFloat(row.subtotal) || 0), 0);
+            }
+        }
+
+        // 2. Calculate Debt Recovered since accepted
+        if (item.payload.affected_customer_ids && item.payload.affected_customer_ids.length > 0) {
+            const { data: payments, error: payError } = await supabaseAdmin
+                .from('payment_transactions')
+                .select('amount')
+                .eq('store_id', storeId)
+                .in('customer_id', item.payload.affected_customer_ids)
+                .eq('transaction_type', 'debt_clearance')
+                .gte('created_at', item.acted_at);
+
+            if (!payError && payments) {
+                newAmount += payments.reduce((sum, row) => sum + (parseFloat(row.amount) || 0), 0);
+            }
+        }
+
+        // If amount changed, update DB and memory ref
+        const savedAmount = parseFloat(item.actual_amount) || 0;
+        if (newAmount > 0 && newAmount !== savedAmount) {
+            item.actual_amount = newAmount;
+            await supabaseAdmin
+                .from('ai_recommendations')
+                .update({ actual_amount: newAmount })
+                .eq('id', item.id);
+        }
+    }
+    return items;
+}
+// ----------------------------------------
+
 // GET /api/ai/recommendations/stats - Get stats for summary card
 router.get('/recommendations/stats', async (req, res) => {
     try {
         const storeId = req.headers['x-store-id'];
         const userId = req.headers['x-user-id'] || req.user?.id;
+        const { period = 'week' } = req.query;
 
         if (!storeId || !userId) return res.status(400).json({ success: false, error: 'Store and User ID required' });
 
-        // Get this month's data
-        const startOfMonth = new Date();
-        startOfMonth.setDate(1);
-        startOfMonth.setHours(0, 0, 0, 0);
+        // Calculate start date based on period
+        let startDate = new Date();
+        startDate.setHours(0, 0, 0, 0);
+        if (period === 'today') {
+            // Already set to today start
+        } else if (period === 'month') {
+            startDate.setDate(1);
+        } else { // default to week
+            const day = startDate.getDay() || 7; // Get current day number, make Sunday (0) become 7
+            if (day !== 1) startDate.setHours(-24 * (day - 1)); // Adjust to previous Monday
+        }
 
-        const { data: monthData, error: monthError } = await supabaseAdmin
+        const { data: periodData, error: periodError } = await supabaseAdmin
             .from('ai_recommendations')
-            .select('status, actual_amount, type')
+            .select('id, status, actual_amount, type, payload, acted_at')
             .eq('store_id', storeId)
             .eq('user_id', userId)
-            .gte('created_at', startOfMonth.toISOString());
+            .gte('created_at', startDate.toISOString());
 
-        if (monthError) throw monthError;
+        if (periodError) throw periodError;
+
+        // Sync real money explicitly for memory
+        await syncRealMoneyEarned(storeId, periodData);
 
         // Calculate stats
-        const totalRecommendations = monthData?.length || 0;
-        const accepted = monthData?.filter(r => r.status === 'accepted') || [];
+        const totalRecommendations = periodData?.length || 0;
+        const accepted = periodData?.filter(r => r.status === 'accepted') || [];
         const followedCount = accepted.length;
         const moneyEarned = accepted.reduce((sum, r) => sum + (parseFloat(r.actual_amount) || 0), 0);
 
         // Type breakdown
         const byType = {
-            expiry: monthData?.filter(r => r.type === 'expiry' && r.status === 'accepted').length || 0,
-            debt: monthData?.filter(r => r.type === 'debt' && r.status === 'accepted').length || 0,
-            stock: monthData?.filter(r => r.type === 'stock' && r.status === 'accepted').length || 0,
+            expiry: periodData?.filter(r => r.type === 'expiry' && r.status === 'accepted').length || 0,
+            debt: periodData?.filter(r => r.type === 'debt' && r.status === 'accepted').length || 0,
+            stock: periodData?.filter(r => r.type === 'stock' && r.status === 'accepted').length || 0,
         };
 
-        // Calculate week number
-        const weekOfMonth = Math.ceil(new Date().getDate() / 7);
+        // Determine dynamic label (e.g. "สัปดาห์ที่ 1", "วันนี้", "เดือนนี้")
+        // If it's a week, calculate which week of the month it is.
+        let dynamicLabelLabelValue = weekOfMonth = Math.ceil(new Date().getDate() / 7);
+        let dynamicLabelString = `สัปดาห์ที่ ${weekOfMonth}`;
+        if (period === 'today') dynamicLabelString = 'วันนี้';
+        if (period === 'month') dynamicLabelString = 'เดือนนี้';
 
         res.json({
             success: true,
             data: {
-                weekNumber: weekOfMonth,
+                label: dynamicLabelString,
                 totalRecommendations,
                 followedCount,
                 followedPercent: totalRecommendations > 0 ? Math.round((followedCount / totalRecommendations) * 100) : 0,
@@ -909,8 +1073,18 @@ router.get('/recommendations/stats', async (req, res) => {
 
 router.get('/active-promotions', async (req, res) => {
     const storeId = req.headers['x-store-id'];
-    const today = new Date().toISOString().split('T')[0];
+    const bangkokOffset = 7 * 3600 * 1000;
+    const today = new Date(Date.now() + bangkokOffset).toISOString().split('T')[0];
 
+    // 1. Auto clean-up expired promotions
+    await supabaseAdmin
+        .from('promotions')
+        .update({ is_active: false })
+        .eq('store_id', storeId)
+        .eq('is_active', true)
+        .lt('end_date', today);
+
+    // 2. Fetch remaining active promotions
     const { data, error } = await supabaseAdmin
         .from('promotions')
         .select(`
@@ -922,7 +1096,6 @@ router.get('/active-promotions', async (req, res) => {
         .eq('store_id', storeId)
         .eq('is_active', true)
         .lte('start_date', today)
-        .gte('end_date', today)
         .order('created_at', { ascending: false });
     res.json({ success: true, data: data || [] });
 });
@@ -960,7 +1133,7 @@ router.post('/apply-promotion', async (req, res) => {
             .select('id, name, price, cost_price')
             .eq('store_id', storeId)
             .is('deleted_at', null)
-            .or(productNames.map(n => `name.ilike.%${n}%`).join(','));
+            .or(productNames.map(n => `name.ilike."%${n.replace(/"/g, '""')}%"`).join(','));
 
         if (productError) throw productError;
 
@@ -1110,10 +1283,10 @@ router.post('/dispose-product', async (req, res) => {
         // 1. Find products by name
         const { data: products, error: productError } = await supabaseAdmin
             .from('products')
-            .select('id, name, stock_qty')
+            .select('id, name, stock_qty, unit_type')
             .eq('store_id', storeId)
             .is('deleted_at', null)
-            .or(productNames.map(n => `name.ilike.%${n}%`).join(','));
+            .or(productNames.map(n => `name.ilike."%${n.replace(/"/g, '""')}%"`).join(','));
 
         if (productError) throw productError;
 
@@ -1173,7 +1346,7 @@ router.post('/dispose-product', async (req, res) => {
                 .update({
                     status: 'accepted',
                     acted_at: new Date().toISOString(),
-                    actual_outcome: `ตัดสต็อก ${totalDisposed} ชิ้น จาก ${disposedItems.length} batch`
+                    actual_outcome: `ตัดสต็อก ${totalDisposed} ${products?.[0]?.unit_type || 'ชิ้น'} จาก ${disposedItems.length} batch`
                 })
                 .eq('id', recommendationId);
         }
