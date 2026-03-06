@@ -443,6 +443,33 @@ const registerNotificationRoutes = ({
                 await supabaseAdmin.from('products').delete().in('id', ids);
                 results.cleaned += ids.length;
             }
+
+            // 9. Auto-purge empty batches older than 2 years (Data Archiving)
+            const twoYearsAgo = new Date();
+            twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+            
+            // Note: product_batches doesn't have store_id directly, so we join with products to filter by storeId
+            const { data: oldBatches } = await supabaseAdmin
+                .from('product_batches')
+                .select('id, products!inner(store_id)')
+                .eq('remaining_qty', 0)
+                .lt('created_at', twoYearsAgo.toISOString())
+                .eq('products.store_id', storeId)
+                .limit(100); // Process in chunks to prevent memory overload
+
+            if (oldBatches && oldBatches.length > 0) {
+                const batchIds = oldBatches.map(b => b.id);
+                
+                // Set batch_id to NULL to prevent breaking order history and inventory transactions
+                await supabaseAdmin.from('order_items').update({ batch_id: null }).in('batch_id', batchIds);
+                await supabaseAdmin.from('inventory_transactions').update({ batch_id: null }).in('batch_id', batchIds);
+                
+                // Safely delete empty batches
+                await supabaseAdmin.from('product_batches').delete().in('id', batchIds);
+                
+                results.cleaned += batchIds.length;
+            }
+
             return results;
 
         } catch (error) {
