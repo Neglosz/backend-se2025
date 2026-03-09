@@ -27,7 +27,10 @@ const authMiddleware = async (req, res, next) => {
         const { data: { user }, error } = await supabase.auth.getUser(token);
 
         if (error || !user) {
-            console.error('Auth Error:', error);
+            // AuthSessionMissingError = token expired (expected), don't spam logs
+            if (error && error.name !== 'AuthSessionMissingError') {
+                console.error('Auth Error:', error);
+            }
             return res.status(401).json({ success: false, error: 'Invalid or Expired Token' });
         }
 

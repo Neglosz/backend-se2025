@@ -1703,6 +1703,11 @@ router.post('/apply-promotion', async (req, res) => {
         products.length = products_filtered.length;
         products_filtered.forEach((p, i) => { products[i] = p; });
 
+        // Validate: ห้ามลด 100% ขึ้นไป (ต้องใช้ dispose แทน)
+        if (promotionType === 'discount_percent' && discountPercent >= 100) {
+            return res.status(400).json({ success: false, error: 'ไม่อนุญาตให้ลดราคา 100% — หากต้องการตัดสินค้าออกให้ใช้ endpoint dispose แทน' });
+        }
+
         // 2. Setup Promotion Details
         let promoDiscountValue = discountPercent || 20;
         let dbPromoType = 'discount_percent';
