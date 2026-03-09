@@ -1,27 +1,47 @@
 const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
+    const TH_OFFSET_MS = 7 * 60 * 60 * 1000; // UTC+7
+
+    // แปลง ISO string เป็นเวลาไทย (UTC+7) แล้วดึง hour
+    const toThaiHour = (isoString) => {
+        return (new Date(isoString).getUTCHours() + 7) % 24;
+    };
+
+    // แปลง ISO string เป็น "วัน/เดือน" ตามเวลาไทย
+    const toThaiDateStr = (isoString) => {
+        const thDate = new Date(new Date(isoString).getTime() + TH_OFFSET_MS);
+        return `${thDate.getUTCDate()}/${thDate.getUTCMonth() + 1}`;
+    };
+
+    // คืนค่า "วันนี้" ตามเวลาไทย (UTC+7)
+    const getThaiNow = () => new Date(Date.now() + TH_OFFSET_MS);
+
     const getDateRange = (period) => {
-        const now = new Date();
-        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+        const nowTH = getThaiNow();
+        const y = nowTH.getUTCFullYear();
+        const m = nowTH.getUTCMonth();
+        const d = nowTH.getUTCDate();
+        const dow = nowTH.getUTCDay(); // 0=Sun
+
+        // เวลาเริ่มต้น/สิ้นสุดของวันนี้ในไทย → แปลงกลับเป็น UTC
+        const todayStart = new Date(Date.UTC(y, m, d, 0, 0, 0) - TH_OFFSET_MS);
+        const todayEnd   = new Date(Date.UTC(y, m, d, 23, 59, 59, 999) - TH_OFFSET_MS);
 
         let start, end;
 
         if (period === 'today' || period === 'day') {
-            start = today.toISOString();
-            end = endOfDay.toISOString();
+            start = todayStart.toISOString();
+            end   = todayEnd.toISOString();
         } else if (period === 'month') {
-            start = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-            end = endOfDay.toISOString();
+            start = new Date(Date.UTC(y, m, 1, 0, 0, 0) - TH_OFFSET_MS).toISOString();
+            end   = todayEnd.toISOString();
         } else if (period === 'year') {
-            start = new Date(now.getFullYear(), 0, 1).toISOString();
-            end = endOfDay.toISOString();
+            start = new Date(Date.UTC(y, 0, 1, 0, 0, 0) - TH_OFFSET_MS).toISOString();
+            end   = todayEnd.toISOString();
         } else if (period === 'week') {
-            // Start of week (Monday)
-            const day = now.getDay() || 7; // Get current day number, converting Sun (0) to 7
-            if (day !== 1) now.setHours(-24 * (day - 1));
-            now.setHours(0, 0, 0, 0);
-            start = now.toISOString();
-            end = endOfDay.toISOString();
+            // จันทร์ของสัปดาห์นี้ (ไทย)
+            const daysFromMonday = dow === 0 ? 6 : dow - 1;
+            start = new Date(Date.UTC(y, m, d - daysFromMonday, 0, 0, 0) - TH_OFFSET_MS).toISOString();
+            end   = todayEnd.toISOString();
         }
 
         return { start, end };
@@ -53,26 +73,27 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
             const totalSales = currentData.reduce((sum, order) => sum + (parseFloat(order.total_amount) || 0), 0);
             const totalOrders = currentData.length;
 
-            // Previous Period Sales (for growth calculation)
-            // Simply comparing today vs yesterday, this month vs last month
+            // Previous Period Sales (for growth calculation) — ใช้เวลาไทย UTC+7
             let prevStart, prevEnd;
-            const now = new Date();
+            const nowTH = getThaiNow();
+            const y = nowTH.getUTCFullYear();
+            const mo = nowTH.getUTCMonth();
+            const d = nowTH.getUTCDate();
 
             if (period === 'today') {
-                const yesterday = new Date(now);
-                yesterday.setDate(now.getDate() - 1);
-                yesterday.setHours(0, 0, 0, 0);
-                prevStart = yesterday.toISOString();
-
-                const yesterdayEnd = new Date(now);
-                yesterdayEnd.setDate(now.getDate() - 1);
-                yesterdayEnd.setHours(23, 59, 59, 999);
-                prevEnd = yesterdayEnd.toISOString();
+                // เมื่อวาน (เวลาไทย)
+                prevStart = new Date(Date.UTC(y, mo, d - 1, 0, 0, 0) - TH_OFFSET_MS).toISOString();
+                prevEnd   = new Date(Date.UTC(y, mo, d - 1, 23, 59, 59, 999) - TH_OFFSET_MS).toISOString();
+            } else if (period === 'week') {
+                // สัปดาห์ก่อน (จันทร์-อาทิตย์)
+                const dow = nowTH.getUTCDay();
+                const daysFromMonday = dow === 0 ? 6 : dow - 1;
+                prevStart = new Date(Date.UTC(y, mo, d - daysFromMonday - 7, 0, 0, 0) - TH_OFFSET_MS).toISOString();
+                prevEnd   = new Date(Date.UTC(y, mo, d - daysFromMonday - 1, 23, 59, 59, 999) - TH_OFFSET_MS).toISOString();
             } else if (period === 'month') {
-                const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-                prevStart = lastMonth.toISOString();
-                const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
-                prevEnd = lastMonthEnd.toISOString();
+                // เดือนที่แล้ว
+                prevStart = new Date(Date.UTC(y, mo - 1, 1, 0, 0, 0) - TH_OFFSET_MS).toISOString();
+                prevEnd   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999) - TH_OFFSET_MS).toISOString();
             }
 
             let growth = 0;
@@ -138,76 +159,82 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
             let peakAmount = 0;
 
             if (period === 'today') {
-                // Group by hour
+                // Group by hour เวลาไทย (UTC+7) ใช้ toThaiHour helper
                 const hourlyData = new Array(24).fill(0);
                 orders.forEach(order => {
-                    const hour = new Date(order.created_at).getUTCHours() + 7; // Adjust for UTC+7 (Thailand) roughly, or better use client time. 
-                    // For simplicity assuming server is UTC and we want +7 display. 
-                    // Better: Parse date properly.
-                    const localDate = new Date(order.created_at);
-                    // Simple localized hour:
-                    const localHour = (localDate.getHours() + 7) % 24; // Mocking Timezone adjustment if server is UTC.
-                    // Assuming database stores UTC.
-                    // NOTE: Proper way is to handle TZ in query or use a library. 
-                    // For this quick impl, we'll map created_at string directly if it has offset, or assume UTC.
-                    // Let's assume input is UTC.
-
-                    // Hacky TZ adjust +7
-                    const date = new Date(order.created_at);
-                    date.setHours(date.getHours() + 7);
-                    const h = date.getHours();
+                    const h = toThaiHour(order.created_at);
                     hourlyData[h] += parseFloat(order.total_amount);
                 });
 
-                // Filter to show active range (e.g. 06:00 to 22:00 or current time)
-                // Showing simplifed: 09:00, 12:00, 15:00, 18:00, 21:00
-                const keyHours = [9, 12, 15, 18, 21];
+                // แสดงเฉพาะ hour ที่มียอดขายจริง เรียงตามเวลา
+                const keyHours = hourlyData
+                    .map((val, h) => ({ h, val }))
+                    .filter(({ val }) => val > 0)
+                    .map(({ h }) => h);
+
                 labels = keyHours.map(h => `${h}:00`);
-                values = keyHours.map(h => hourlyData[h]);
+                values = keyHours.map(h => Math.round(hourlyData[h]));
 
-                // Find peak
-                let maxVal = 0;
-                let maxIdx = 0;
                 hourlyData.forEach((val, idx) => {
-                    if (val > maxVal) {
-                        maxVal = val;
-                        maxIdx = idx;
-                    }
+                    if (val > peakAmount) { peakAmount = val; peakTime = `${idx}:00 น.`; }
                 });
-                peakAmount = maxVal;
-                peakTime = `${maxIdx}:00 น.`;
 
-            } else if (period === 'week' || period === 'month') {
-                // Group by Day
+            } else if (period === 'week') {
+                // สร้าง key วันจันทร์ถึงวันนี้ (เวลาไทย)
+                const nowTH = getThaiNow();
+                const dow = nowTH.getUTCDay(); // 0=Sun
+                const daysFromMonday = dow === 0 ? 6 : dow - 1;
                 const dailyData = {};
+
+                for (let i = 0; i <= daysFromMonday; i++) {
+                    const d = new Date(Date.UTC(
+                        nowTH.getUTCFullYear(), nowTH.getUTCMonth(),
+                        nowTH.getUTCDate() - daysFromMonday + i
+                    ));
+                    dailyData[`${d.getUTCDate()}/${d.getUTCMonth() + 1}`] = 0;
+                }
+
                 orders.forEach(order => {
-                    // Adjust +7
-                    const date = new Date(order.created_at);
-                    date.setHours(date.getHours() + 7);
-                    const dayStr = `${date.getDate()}/${date.getMonth() + 1}`;
-                    dailyData[dayStr] = (dailyData[dayStr] || 0) + parseFloat(order.total_amount);
+                    const key = toThaiDateStr(order.created_at);
+                    if (key in dailyData) dailyData[key] += parseFloat(order.total_amount);
                 });
 
                 labels = Object.keys(dailyData);
-                values = Object.values(dailyData);
+                values = Object.values(dailyData).map(v => Math.round(v));
 
-                // Find peak
-                let maxVal = 0;
-                let maxKey = '-';
                 for (const [key, val] of Object.entries(dailyData)) {
-                    if (val > maxVal) {
-                        maxVal = val;
-                        maxKey = key;
-                    }
+                    if (val > peakAmount) { peakAmount = val; peakTime = key; }
                 }
-                peakAmount = maxVal;
-                peakTime = maxKey;
+
+            } else if (period === 'month') {
+                // สร้าง key วันที่ 1 ถึงวันนี้ (เวลาไทย)
+                const nowTH = getThaiNow();
+                const y = nowTH.getUTCFullYear();
+                const mo = nowTH.getUTCMonth();
+                const todayDate = nowTH.getUTCDate();
+                const dailyData = {};
+
+                for (let d = 1; d <= todayDate; d++) {
+                    dailyData[`${d}/${mo + 1}`] = 0;
+                }
+
+                orders.forEach(order => {
+                    const key = toThaiDateStr(order.created_at);
+                    if (key in dailyData) dailyData[key] += parseFloat(order.total_amount);
+                });
+
+                labels = Object.keys(dailyData);
+                values = Object.values(dailyData).map(v => Math.round(v));
+
+                for (const [key, val] of Object.entries(dailyData)) {
+                    if (val > peakAmount) { peakAmount = val; peakTime = key; }
+                }
             }
 
-            // If no data, return empty zeros
+            // ถ้าไม่มีข้อมูลเลย ส่ง empty array (frontend จะ handle เอง)
             if (values.length === 0) {
-                labels = ['09:00', '12:00', '15:00', '18:00', '21:00'];
-                values = [0, 0, 0, 0, 0];
+                labels = [];
+                values = [];
             }
 
             res.json({

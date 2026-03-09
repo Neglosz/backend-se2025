@@ -146,6 +146,31 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
         }
     });
 
+    // Cancel Order (called when deleting a linked sales transaction)
+    app.patch('/api/orders/:id/cancel', async (req, res) => {
+        try {
+            const { id } = req.params;
+            const storeId = req.headers['x-store-id'];
+            const userId = req.user.id;
+
+            if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+            if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+            const { error } = await supabaseAdmin
+                .from('orders')
+                .update({ payment_status: 'cancelled' })
+                .eq('id', id)
+                .eq('store_id', storeId);
+
+            if (error) throw error;
+
+            res.json({ success: true });
+        } catch (error) {
+            console.error('Cancel Order Error:', error);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    });
+
     // Get Single Order Details (for Receipt)
     app.get('/api/orders/:id', async (req, res) => {
         try {
