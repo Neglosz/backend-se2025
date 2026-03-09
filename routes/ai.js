@@ -368,6 +368,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
 
     const lowMarginHighVolume = []; // ขายดีแต่กำไรบางเฉียบ
     const highMarginLowVolume = []; // กำไรงามแต่ขายไม่ออก
+    const pricingCandidates = []; // สินค้าพร้อมข้อมูลจริงสำหรับ AI วิเคราะห์ราคา
     products?.forEach(p => {
         const soldQty = productSalesQty[p.id] || 0;
         const threshold = parseFloat(p.low_stock_threshold) || 5;
@@ -408,6 +409,23 @@ const getStoreSummary = async (storeId, lat, lon) => {
         if (soldQty > 15 && marginPercent < 15) {
             const unitLbl = p.unit_type || 'ชิ้น';
             lowMarginHighVolume.push(`${p.name} (ขายไป ${soldQty} ${unitLbl} แต่กำไรต่อหน่วยละ ${marginPercent}%)`);
+        }
+        // 4. เก็บข้อมูลราคาจริงสำหรับ AI วิเคราะห์ type=pricing
+        const cost = parseFloat(p.cost_price) || 0;
+        const sellPrice = parseFloat(p.price) || 0;
+        if (cost > 0 && sellPrice > 0 && parseFloat(p.stock_qty) > 0) {
+            const needsPricingReview = marginPercent < 20 || (soldQty === 0 && marginPercent > 25);
+            if (needsPricingReview) {
+                pricingCandidates.push({
+                    name: p.name,
+                    cost,
+                    price: sellPrice,
+                    margin: marginPercent,
+                    stock: Math.round(parseFloat(p.stock_qty)),
+                    unit: p.unit_type || 'ชิ้น',
+                    sold30d: soldQty,
+                });
+            }
         }
     });
 
@@ -506,6 +524,13 @@ ${expiryListText}
 - ⚠️ สินค้าขายตีคู่แต่กำไรบางเฉียบ (พิจารณาขึ้นราคา): ${lowMarginHighVolume.slice(0, 3).join(', ') || 'ไม่มี'}
 - 💎 สินค้ากำไรสูงลิบแต่ขายไม่ออก (ควรนำมาจับคู่โปรโมชั่นหรือดันหน้าร้าน): ${highMarginLowVolume.slice(0, 3).join(', ') || 'ไม่มี'}
 
+💰 ข้อมูลราคาสินค้าจริง (สำหรับวิเคราะห์ type=pricing เท่านั้น — ใช้ตัวเลขนี้โดยตรง ห้ามเดา):
+${pricingCandidates.length > 0
+    ? pricingCandidates.map(p =>
+        `- ${p.name}: ทุน ฿${p.cost} | ขายที่ ฿${p.price} | กำไร ${p.margin}% | stock ${p.stock} ${p.unit} | ขายได้ ${p.sold30d} ชิ้น/30วัน`
+    ).join('\n')
+    : '- ไม่มีสินค้าที่ต้องปรับราคา (margin ปกติทุกตัว)'}
+
 🏷️ โปรโมชั่นที่ใช้อยู่ตอนนี้:
 ${activePromoList.join('\n') || 'ไม่มีโปรโมชั่น active'}
 - สินค้าที่มีโปรอยู่แล้ว (ห้ามแนะนำซ้ำ): ${promoProductNames.length > 0 ? promoProductNames.join(', ') : 'ไม่มี'}
@@ -517,7 +542,7 @@ GOAL: ใช้ข้อมูลจริงข้างบนเท่าน�
 
     return {
         context: contextText,
-        raw: { address, weather, salesMonth, profitMonth, debtList, expiryList, expiresTodayList, expiredList, deadStockList, reorderList, zeroStockProducts, promoProductNames }
+        raw: { address, weather, salesMonth, profitMonth, debtList, expiryList, expiresTodayList, expiredList, deadStockList, reorderList, zeroStockProducts, promoProductNames, pricingCandidates }
     };
 };
 
@@ -738,11 +763,9 @@ router.get('/recommendations', async (req, res) => {
         const currentTotalCount = allExisting?.length || 0;
         const pendingExisting = allExisting?.filter(r => r.status === 'pending') || [];
 
-        if (currentTotalCount >= 5 && period !== 'today') {
-            // For historical periods, simply return what we found, do not re-generate.
-            return res.json({ success: true, data: pendingExisting, cached: true });
-        } else if (currentTotalCount >= 5 && period === 'today') {
-            // Today logic: if fully generated today and we have >= 5 total, return cache
+        if (currentTotalCount > 0) {
+            // หากมีการ gen ไปแล้วในวันนี้ ไม่ว่าจะกี่รายการก็ตาม หรือจะถูก acted_at ไปแล้วก็ตาม ให้คืนค่ารายการที่ยัง pending อยู่กลับไปเท่านั้น
+            // ป้องกันปัญหาการพยายาม Gen ใหม่เติมเรื่อยๆ ทุกครั้งที่กดเข้ามาหน้านี้ถ้ามีคนกด accept/skip ไปแล้ว
             return res.json({ success: true, data: pendingExisting, cached: true });
         }
 
@@ -761,8 +784,8 @@ router.get('/recommendations', async (req, res) => {
         // 2. Generate New Recommendations using Gemini
         const data = await getStoreSummary(storeId, lat, lon);
 
-        // Calculate how many we need to generate to reach 5
-        const targetGenerationCount = Math.max(1, 5 - currentTotalCount);
+        // Generate exactly 5 recommendations since we only do this once per day now
+        const targetGenerationCount = 5;
 
         // Collect target_products from existing pending recommendations to avoid duplication
         const alreadyRecommendedProducts = [];
@@ -775,13 +798,16 @@ router.get('/recommendations', async (req, res) => {
             } catch (_) {}
         }
 
+        const activePromoNames = (data.raw.promoProductNames || []);
+
         const prompt = `
 ${data.context}
 ${alreadyRecommendedProducts.length > 0 ? `\n⚠️ สินค้าที่แนะนำไปแล้วในวันนี้ (ห้ามนำมาแนะนำซ้ำเด็ดขาด): ${[...new Set(alreadyRecommendedProducts)].join(', ')}` : ''}
+${activePromoNames.length > 0 ? `\n🚫 สินค้าที่มีโปรโมชั่น active อยู่แล้ว ห้ามนำมาสร้าง recommended_discount เด็ดขาด (ยกเว้น action=dispose): ${activePromoNames.join(', ')}\n   → ถ้าไม่มีสินค้าอื่นที่น่าสนใจสำหรับโปร ให้เปลี่ยนไปแนะนำ type=stock, type=debt, หรือ type=pricing แทน เพื่อให้ครบ 5 ข้อ` : ''}
 
 คุณคือ "ผู้จัดการร้านมืออาชีพ" ที่เข้าใจร้านโชห่วยไทยอย่างลึกซึ้ง
 คุณรู้ทุกอย่างเกี่ยวกับร้านนี้ — ยอดขาย สต็อก ลูกหนี้ สินค้าใกล้หมดอายุ สภาพอากาศ ฤดูกาล
-หน้าที่ของคุณคือ ให้คำแนะนำ ${targetGenerationCount} ข้อที่ส่งผลกระทบต่อรายได้ร้านมากที่สุด
+หน้าที่ของคุณคือ ให้คำแนะนำจำนวน 5 ข้อแบบเป๊ะๆ ที่ส่งผลกระทบต่อรายได้ร้านมากที่สุด
 
 📌 ลำดับความสำคัญ (เรียงจากสำคัญสุด):
   A. 🚨 ด่วน — สินค้าหมดอายุแล้ว/ใกล้หมดอายุ (ทุกวันที่ไม่ทำ = เสียเงินจริง)
@@ -789,7 +815,7 @@ ${alreadyRecommendedProducts.length > 0 ? `\n⚠️ สินค้าที่�
   C. 📦 สต็อกขายดีใกล้หมด (ดึงจาก REORDER SOON และแจ้งยอดที่ "ควรสั่งเพิ่มด่วน")
   D. 💡 กลยุทธ์การขาย/ปรับราคา (ดึงจาก TRENDS & PRICING STRATEGY เช่น ปรับราคาขึ้นสำหรับของที่กำไรบาง หรือจัดโปรของที่กำไรงาม)
 
-สร้าง ${targetGenerationCount} คำแนะนำในรูปแบบ JSON array เรียงตามลำดับ A → B → C → D:
+สร้างคำแนะนำ 5 ข้อในรูปแบบ JSON array เรียงตามลำดับความสำคัญ (ต้องมีครบ 5 ข้อ ห้ามขาดห้ามเกิน):
 
 [
   {
@@ -803,9 +829,13 @@ ${alreadyRecommendedProducts.length > 0 ? `\n⚠️ สินค้าที่�
     "icon": "alert-triangle | account-clock | package-variant | trending-up",
 
     "target_customers": ["ชื่อลูกหนี้ - เฉพาะ type=debt"],
-    "target_products": ["ชื่อสินค้า - เฉพาะ type=expiry/stock/promotion"],
+    "target_products": ["ชื่อสินค้า - เฉพาะ type=expiry/stock/promotion/pricing"],
 
-    "recommended_discount": { // ใส่ null เท่านั้น ถ้าเป็นการแนะนำ "เติมสต็อก" ของขายดี หรือ ตัดสต็อก
+    "suggested_price": 25,
+    "current_price": 20,
+    "price_change_reason": "ร้านชำแถวนี้ขายกัน ฿25 อยู่แล้ว กำไรบางเกินไป",
+
+    "recommended_discount": {
       "promotion_type": "discount_percent" | "buy_x_get_y" | "bundle",
       "percent": 20,
       "discount_amount": 10,
@@ -848,7 +878,7 @@ ${alreadyRecommendedProducts.length > 0 ? `\n⚠️ สินค้าที่�
    - ถ้าข้อมูลเขียนว่า "OISHI" ต้องเขียน "OISHI" ไม่ใช่ "โออิชิ"
 
 6. **reason ต้องมีโครงสร้างชัดเจน แยกเป็นข้อๆ**:
-   "1. สถานการณ์: [บอกตรงๆ ว่าเกิดอะไร เช่น กุ้งแม่น้ำ 393 กก. จะหมดวันนี้!]\\n2. ผลกระทบ: [ถ้าไม่ทำอะไร = เสียเงิน ฿xx เปล่าๆ / ถ้าจัดโปร = ขายออก ได้เงินคืน ฿yy — ห้ามใส่สูตรคณิตศาสตร์]\\n3. ทำอะไรเดี๋ยวนี้: [บอกชัดๆ ว่าทำอะไร และทำไม ภาษาพูดธรรมดา]"
+   "1. สถานการณ์: [บอกตรงๆ ว่าเกิดอะไร เช่น กุ้งแม่น้ำ 393 กก. จะหมดวันนี้!]\\n2. ผลกระทบ: [ถ้าไม่ทำอะไร = เสียเงิน ฿xx เปล่าๆ / ถ้าจัดโปร = ขายออก ได้เงินคืน ฿yy — ห้ามใส่สูตรคณิตศาสตร์]\\n3. ต้องทำอะไร: [บอกชัดๆ ว่าทำอะไร และทำไม ภาษาพูดธรรมดา]"
 
 7. **expected_impact ต้องเป็นภาษาพูดของเจ้าของร้านชำ ห้ามใช้สูตรคณิตศาสตร์ใน expected_impact เด็ดขาด**:
    - ❌ "คืนทุน ฿98,250 (ปกติกำไร 393 กก. × ฿110 = ฿43,230)" → ซับซ้อนเกิน
@@ -873,7 +903,7 @@ ${alreadyRecommendedProducts.length > 0 ? `\n⚠️ สินค้าที่�
 11. **ห้ามแนะนำโปรสินค้าที่มีโปรอยู่แล้วเด็ดขาด!**
     - ตรวจสอบจากข้อมูล 🏷️ โปรโมชั่นที่ใช้อยู่ตอนนี้ ถ้าสินค้าไหนมีชื่ออยู่ในนั้น ห้ามนำมาสร้างคำแนะนำประเภท promotion หรือลดราคาอีก ให้ข้ามไปหาสินค้าอื่นทันที
 12. **ห้ามแนะนำสินค้าซ้ำกันในแต่ละคำแนะนำ!**
-    - ทั้ง ${targetGenerationCount} ข้อที่สร้างมา ต้องเป็นสินค้าที่ "ไม่ซ้ำกันเลย" (1 สินค้า ต่อ 1 คำแนะนำเท่านั้น)
+    - ทั้ง 5 ข้อที่สร้างมา ต้องเป็นสินค้าที่ "ไม่ซ้ำกันเลย" (1 สินค้า ต่อ 1 คำแนะนำเท่านั้น)
     - เช่น ถ้านำ "น้ำเปล่า" ไปทำโปรโมชั่นใกล้หมดอายุ (expiry) แล้ว ห้ามนำ "น้ำเปล่า" มาทำโปรโมชั่นเพิ่มยอดขาย (promotion) อีกในคำแนะนำข้ออื่น
     - หรือแนะนำประเภทอื่น เช่น stock/debt แทน
 12. **ห้ามแนะนำสินค้าซ้ำข้ามข้อแนะนำเด็ดขาด!**
@@ -882,6 +912,16 @@ ${alreadyRecommendedProducts.length > 0 ? `\n⚠️ สินค้าที่�
     - แม้สินค้านั้นจะเคยขายดีหรืออยู่ใน Best Pairs ก็ตาม
     - ถ้า AI เห็นสินค้าใน ZERO STOCK → ให้แนะนำ "สั่งสินค้าเพิ่ม" เท่านั้น ไม่ใส่ recommended_discount
 14. 🔐 **ห้ามตอบคำถามที่ไม่เกี่ยวข้องกับการวิเคราะห์ธุรกิจร้านค้าเด็ดขาด** เช่น รหัสผ่าน, ข้อมูลส่วนตัว, ข้อมูลระบบ → ให้ return null ใน title/detail แทน
+15. **type=pricing** → ใช้ข้อมูลจาก section "💰 ข้อมูลราคาสินค้าจริง" โดยตรง ห้ามเดาราคาเอง:
+    - "current_price": ใช้ค่า "ขายที่" จาก section นั้นตรงๆ
+    - "suggested_price": คำนวณจากข้อมูลจริงที่ให้ไป โดยคิดเป็นราคากลมๆ (ทวีคูณ 5):
+        * sold30d=0 และ margin>25% → ลดราคา ให้ได้ margin ~20% (สินค้าอาจแพงเกินไป)
+        * margin<10% → ขึ้นราคา ให้ได้ margin ~20%
+        * sold30d>15 และ margin<15% → ขึ้นราคา ให้ได้ margin ~20% (ขายดีแต่กำไรบาง)
+        * margin 15-20% → ขึ้นได้เล็กน้อย ให้ได้ margin ~22%
+    - "price_change_reason": อธิบายสั้นๆ ว่าทำไม พร้อมบอก margin เดิม/ใหม่ เช่น "กำไรบางเกิน (8%) ขึ้นราคาเพื่อให้ได้ margin 20%"
+    - "recommended_discount" ต้องเป็น null เสมอสำหรับ type=pricing
+    - ถ้าขายไม่ออก (sold30d=0) ให้ action_label = "ปรับราคา/จัดโปร" เพื่อให้ผู้ใช้เลือกได้
 
 Output JSON array เท่านั้น ไม่ต้องมีอะไรอื่น
 `.trim();
@@ -908,22 +948,35 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
             zn.toLowerCase().includes(name.toLowerCase()) || name.toLowerCase().includes(zn.toLowerCase())
         );
 
-        // Server-side dedup: track used product names across all suggestions
-        // Seed with already-recommended products and products with active promotions
-        const usedProductNames = new Set([
-            ...alreadyRecommendedProducts.map(n => n.toLowerCase()),
-            ...(data.raw.promoProductNames || []).map(n => n.toLowerCase()),
-        ]);
+        // Server-side dedup: only block promotion-type suggestions for products
+        // that already have an active promotion. Cross-suggestion product dedup is
+        // handled by the AI prompt itself ("1 สินค้า ต่อ 1 คำแนะนำ").
+        const promoProductNamesSet = new Set(
+            (data.raw.promoProductNames || []).map(n => n.toLowerCase())
+        );
+
+        console.log(`[AI Recs] AI returned ${suggestions.length} suggestions`);
 
         const dedupedSuggestions = suggestions.filter(s => {
-            if (!Array.isArray(s.target_products) || s.target_products.length === 0) return true;
-            const hasOverlap = s.target_products.some(name => usedProductNames.has(name.toLowerCase()));
-            if (hasOverlap) return false;
-            s.target_products.forEach(name => usedProductNames.add(name.toLowerCase()));
+            // If any target_product already has an active promotion:
+            if (s.recommended_discount && s.recommended_discount?.action !== 'dispose' &&
+                Array.isArray(s.target_products) && s.target_products.length > 0) {
+                const hasActivePromo = s.target_products.some(name => promoProductNamesSet.has(name.toLowerCase()));
+                if (hasActivePromo) {
+                    // Drop this suggestion — product already has an active promo,
+                    // no actionable value for the store owner.
+                    // The AI prompt explicitly warns against this; if it still happens,
+                    // we prefer 4 quality suggestions over 5 with a useless one.
+                    console.log(`[AI Recs] Dropped ${s.type} suggestion: ${s.target_products.join(', ')} already has active promo`);
+                    return false;
+                }
+            }
             return true;
         });
 
-        const toInsert = dedupedSuggestions.slice(0, targetGenerationCount).map(s => {
+        console.log(`[AI Recs] After dedup: ${dedupedSuggestions.length} suggestions`);
+
+        const toInsert = await Promise.all(dedupedSuggestions.slice(0, 5).map(async s => {
             // ---- ZERO STOCK GUARD ----
             // If AI still recommends a promotion for a zero-stock product, convert to restock
             if (["promotion", "expiry", "stock"].includes(s.type) &&
@@ -990,14 +1043,75 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                     ? (data.raw.reorderList || [])
                     : (data.raw.deadStockList || []);
 
-                const filteredProducts = targetProducts.length > 0
+                // Fallback list: expiry products (AI sometimes classifies near-expiry as stock)
+                const allExpirySource = [
+                    ...(data.raw.expiredList || []),
+                    ...(data.raw.expiresTodayList || []),
+                    ...(data.raw.expiryList || [])
+                ];
+
+                let filteredProducts = targetProducts.length > 0
                     ? sourceList.filter(p =>
                         targetProducts.some(name =>
                             p.name.includes(name) || name.includes(p.name)
                         )
                     )
                     : sourceList.slice(0, 1);
+
+                // Fallback: if nothing found in primary list, try expiry lists
+                // (AI sometimes classifies near-expiry products as type=stock)
+                if (filteredProducts.length === 0 && targetProducts.length > 0) {
+                    filteredProducts = allExpirySource.filter(p =>
+                        targetProducts.some(name =>
+                            p.name.includes(name) || name.includes(p.name)
+                        )
+                    );
+                }
+
                 payload.products = filteredProducts;
+            }
+
+            // For pricing type: fetch product data from DB to get current price, stock_qty, and product ID
+            if (s.type === 'pricing' && Array.isArray(s.target_products) && s.target_products.length > 0) {
+                const { data: pricingProducts } = await supabaseAdmin
+                    .from('products')
+                    .select('id, name, price, cost_price, stock_qty, unit_type')
+                    .eq('store_id', storeId)
+                    .is('deleted_at', null)
+                    .or(s.target_products.map(n => `name.ilike.%${n}%`).join(','));
+                payload.products = pricingProducts || [];
+                // Always use real DB price as current_price — AI may hallucinate this
+                payload.current_price = parseFloat(pricingProducts?.[0]?.price) || null;
+                // AI calculates suggested_price using real data provided in prompt
+                payload.suggested_price = s.suggested_price || null;
+                payload.price_change_reason = s.price_change_reason || null;
+
+                // Fallback: if AI returned no price change, calculate from real cost data
+                if (payload.current_price && payload.suggested_price === payload.current_price) {
+                    const productName = pricingProducts?.[0]?.name || '';
+                    const realData = (data.raw.pricingCandidates || []).find(pc =>
+                        fuzzyScore(pc.name, productName) >= 0.45
+                    );
+                    if (realData?.cost > 0) {
+                        const { cost, margin: marginPct } = realData;
+                        const targetRate = (marginPct >= 15 && marginPct < 20) ? 0.22 : 0.20;
+                        const rawPrice = cost / (1 - targetRate);
+                        const rounded = Math.max(5, Math.round(rawPrice / 5) * 5);
+                        if (rounded !== payload.current_price) {
+                            payload.suggested_price = rounded;
+                            const dir = rounded < payload.current_price ? 'ลดราคา' : 'ขึ้นราคา';
+                            const newMgn = Math.round((rounded - cost) / rounded * 100);
+                            payload.price_change_reason = payload.price_change_reason ||
+                                `${dir}ให้ได้กำไร ${newMgn}% (ทุน ฿${cost}, กำไรเดิม ${marginPct}%)`;
+                        }
+                    }
+                }
+                // If price still unchanged after fallback, remove "ปรับราคา" from action_label
+                if (payload.current_price && payload.suggested_price === payload.current_price) {
+                    const parts = (s.action_label || '').split('/').map(p => p.trim());
+                    const filtered = parts.filter(p => !p.includes('ปรับราคา'));
+                    if (filtered.length > 0) s.action_label = filtered.join('/');
+                }
             }
 
             // Override expected_impact — ภาษาร้านชำ เข้าใจง่าย ไม่มีสูตรคณิตศาสตร์
@@ -1039,6 +1153,26 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                 }
             }
 
+            if (s.type === 'pricing' && payload.products?.length > 0) {
+                const p = payload.products[0];
+                const suggestedPrice = payload.suggested_price; // use calculated, not AI's guess
+                const currentPrice = parseFloat(p.price) || 0;
+                const cost = parseFloat(p.cost_price) || 0;
+                const stockQty = Math.round(p.stock_qty || 0);
+                const unit = p.unit_type || 'ชิ้น';
+                if (suggestedPrice && currentPrice && stockQty > 0) {
+                    const diffPerUnit = Math.round(suggestedPrice - currentPrice);
+                    const totalDiff = Math.abs(Math.round(diffPerUnit * stockQty)).toLocaleString('th-TH');
+                    const newMargin = cost > 0 ? Math.round((suggestedPrice - cost) / suggestedPrice * 100) : null;
+                    const marginStr = newMargin ? ` (กำไร ${newMargin}%)` : '';
+                    if (diffPerUnit > 0) {
+                        expected_impact = `ขึ้นราคา ฿${currentPrice}→฿${suggestedPrice}${marginStr} กำไรเพิ่ม ฿${totalDiff} จาก ${stockQty} ${unit}`;
+                    } else if (diffPerUnit < 0) {
+                        expected_impact = `ลดราคา ฿${currentPrice}→฿${suggestedPrice}${marginStr} เพื่อระบาย ${stockQty} ${unit} ออก`;
+                    }
+                }
+            }
+
             if (s.type === 'debt' && payload.amount > 0) {
                 const amt = Math.round(payload.amount).toLocaleString('th-TH');
                 expected_impact = `ทวงคืนมาได้ ฿${amt}`;
@@ -1056,7 +1190,7 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                 status: 'pending',
                 payload
             };
-        });
+        }));
 
         const { data: inserted, error } = await supabaseAdmin
             .from('ai_recommendations')
@@ -1065,7 +1199,7 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
 
         if (error) throw error;
 
-        res.json({ success: true, data: inserted });
+        res.json({ success: true, data: [...pendingExisting, ...(inserted || [])] });
 
     } catch (error) {
         console.error('AI Recommendations Error:', error);
@@ -1835,6 +1969,94 @@ router.post('/dispose-product', async (req, res) => {
 
     } catch (error) {
         console.error('Dispose Product Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==================== SCHEDULED PRICE REMINDERS ====================
+
+// POST /ai/recommendations/:id/schedule — mark as 'scheduled', store trigger info in payload
+router.post('/recommendations/:id/schedule', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const storeId = req.headers['x-store-id'];
+        const { trigger_type, promotion_id, scheduled_price } = req.body;
+
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+
+        const { data: rec, error: fetchErr } = await supabaseAdmin
+            .from('ai_recommendations')
+            .select('payload')
+            .eq('id', id)
+            .eq('store_id', storeId)
+            .single();
+
+        if (fetchErr || !rec) return res.status(404).json({ success: false, error: 'ไม่พบคำแนะนำ' });
+
+        const newPayload = {
+            ...rec.payload,
+            schedule_trigger: trigger_type || 'manual',
+            trigger_promotion_id: promotion_id || null,
+            scheduled_price: scheduled_price || null,
+        };
+
+        const { data, error } = await supabaseAdmin
+            .from('ai_recommendations')
+            .update({ status: 'scheduled', payload: newPayload })
+            .eq('id', id)
+            .eq('store_id', storeId)
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json({ success: true, data });
+    } catch (error) {
+        console.error('Schedule Reminder Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// GET /ai/scheduled-reminders — return pricing reminders that are ready to act on
+router.get('/scheduled-reminders', async (req, res) => {
+    try {
+        const storeId = req.headers['x-store-id'];
+        if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
+
+        const { data: scheduled, error } = await supabaseAdmin
+            .from('ai_recommendations')
+            .select('*')
+            .eq('store_id', storeId)
+            .eq('status', 'scheduled')
+            .eq('type', 'pricing')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        if (!scheduled || scheduled.length === 0) return res.json({ success: true, data: [] });
+
+        // Check each item's trigger condition
+        const results = await Promise.all(scheduled.map(async (rec) => {
+            const triggerType = rec.payload?.schedule_trigger;
+            if (triggerType === 'after_promo') {
+                const promoId = rec.payload?.trigger_promotion_id;
+                if (!promoId) return { ...rec, trigger_ready: true };
+                const { data: promo } = await supabaseAdmin
+                    .from('promotions')
+                    .select('is_active')
+                    .eq('id', promoId)
+                    .single();
+                return { ...rec, trigger_ready: promo?.is_active === false };
+            }
+            // manual trigger — always ready
+            return { ...rec, trigger_ready: true };
+        }));
+
+        const ready = results
+            .filter(r => r.trigger_ready)
+            .map(({ trigger_ready, ...r }) => r);
+
+        res.json({ success: true, data: ready });
+    } catch (error) {
+        console.error('Scheduled Reminders Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });

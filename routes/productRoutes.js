@@ -447,6 +447,35 @@ const registerProductRoutes = ({
         }
     });
 
+    // Update product price (used by AI pricing recommendation)
+    app.put('/api/products/:id/price', async (req, res) => {
+        try {
+            const { id } = req.params;
+            const { newPrice } = req.body;
+            const storeId = req.headers['x-store-id'];
+
+            if (!newPrice || isNaN(newPrice) || parseFloat(newPrice) < 0) {
+                return res.status(400).json({ success: false, error: 'ราคาไม่ถูกต้อง' });
+            }
+
+            const { data, error } = await supabaseAdmin
+                .from('products')
+                .update({ price: parseFloat(newPrice) })
+                .eq('id', id)
+                .eq('store_id', storeId)
+                .select('id, name, price, cost_price, stock_qty')
+                .single();
+
+            if (error) throw error;
+            if (!data) return res.status(404).json({ success: false, error: 'ไม่พบสินค้า' });
+
+            res.json({ success: true, data });
+        } catch (error) {
+            console.error('Update Product Price Error:', error);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    });
+
     // Add new product - now accepts JSON with Supabase Storage URL
     app.post('/api/products', async (req, res) => {
         try {
