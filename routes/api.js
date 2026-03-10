@@ -43,9 +43,6 @@ const registerApiRoutes = ({
         checkStoreAccess
     });
 
-    // Keep this duplicate middleware in the same relative position to preserve existing behavior.
-    app.use('/api', rateLimiter);
-
     registerStockRoutes({
         app,
         supabaseAdmin,
