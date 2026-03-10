@@ -59,12 +59,12 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
 
             const { start, end } = getDateRange(period);
 
-            // Current Period Sales
+            // Current Period Sales (รวม credit_sale ที่ยังค้างด้วย เพราะการขายเกิดขึ้นแล้ว)
             const { data: currentData, error: currentError } = await supabaseAdmin
                 .from('orders')
                 .select('total_amount')
                 .eq('store_id', storeId)
-                .eq('payment_status', 'paid')
+                .neq('payment_status', 'cancelled')
                 .gte('created_at', start)
                 .lte('created_at', end);
 
@@ -102,7 +102,7 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                     .from('orders')
                     .select('total_amount')
                     .eq('store_id', storeId)
-                    .eq('payment_status', 'paid')
+                    .neq('payment_status', 'cancelled')
                     .gte('created_at', prevStart)
                     .lte('created_at', prevEnd);
 
@@ -141,12 +141,12 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
 
             const { start, end } = getDateRange(period);
 
-            // Fetch all paid orders in range
+            // Fetch all orders (รวม credit_sale ค้าง) เพื่อให้ chart consistent กับ summary
             const { data: orders, error } = await supabaseAdmin
                 .from('orders')
                 .select('created_at, total_amount')
                 .eq('store_id', storeId)
-                .eq('payment_status', 'paid')
+                .neq('payment_status', 'cancelled')
                 .gte('created_at', start)
                 .lte('created_at', end)
                 .order('created_at', { ascending: true });
@@ -277,12 +277,16 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                 .gte('paid_at', start)
                 .lte('paid_at', end);
             if (error) throw error;
-            // 2. Fetch credit sales (ขายเครดิตที่ยังไม่จ่าย)
-            const { data: creditOrders, error: creditError } = await supabaseAdmin
-                .from('orders')
-                .select('total_amount')
-                .eq('store_id', storeId)
-                .eq('payment_type', 'credit_sale')
+            // 2. Fetch credit_accounts ที่ยังค้างอยู่ ดึง remaining_amount (ไม่ใช่ total_amount)
+            // ใช้ credit_accounts.created_at โดยตรง (Supabase gte/lte ผ่าน join ไม่ reliable)
+            const { data: creditAccounts, error: creditError } = await supabaseAdmin
+                .from('credit_accounts')
+                .select(`
+                    remaining_amount,
+                    orders!inner(store_id)
+                `)
+                .eq('orders.store_id', storeId)
+                .in('status', ['unpaid', 'partial'])
                 .gte('created_at', start)
                 .lte('created_at', end);
             if (creditError) throw creditError;
@@ -300,9 +304,9 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                 else if (p.method === 'qr_promptpay') stats.qr += amount;
                 else if (p.method === 'credit') stats.credit += amount;
             });
-            // นับจาก credit orders (ยอดขายเครดิตทั้งหมด)
-            creditOrders.forEach(o => {
-                const amount = parseFloat(o.total_amount) || 0;
+            // นับจาก credit_accounts (เฉพาะยอดค้างจริง remaining_amount)
+            creditAccounts.forEach(ca => {
+                const amount = parseFloat(ca.remaining_amount) || 0;
                 stats.credit += amount;
                 total += amount;
             });
