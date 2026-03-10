@@ -278,17 +278,17 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                 .lte('paid_at', end);
             if (error) throw error;
             // 2. Fetch credit_accounts ที่ยังค้างอยู่ ดึง remaining_amount (ไม่ใช่ total_amount)
-            // ใช้ credit_accounts.created_at โดยตรง (Supabase gte/lte ผ่าน join ไม่ reliable)
+            // เพื่อกัน double count กรณี partial payment
             const { data: creditAccounts, error: creditError } = await supabaseAdmin
                 .from('credit_accounts')
                 .select(`
                     remaining_amount,
-                    orders!inner(store_id)
+                    orders!inner(store_id, created_at)
                 `)
                 .eq('orders.store_id', storeId)
                 .in('status', ['unpaid', 'partial'])
-                .gte('created_at', start)
-                .lte('created_at', end);
+                .gte('orders.created_at', start)
+                .lte('orders.created_at', end);
             if (creditError) throw creditError;
             const stats = {
                 cash: 0,
