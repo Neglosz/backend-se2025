@@ -146,7 +146,7 @@ app.post('/api/credit-payments', creditPaymentValidators, async (req, res) => {
         // Fetch all unpaid/partial bills for this customer, ordered by created_at ASC (oldest first)
         const { data: accounts, error: fetchError } = await supabaseAdmin
             .from('credit_accounts')
-            .select('*, customers_info!inner(store_id)')
+            .select('*, customers_info!inner(store_id, name)')
             .eq('customer_id', customer_id)
             .eq('customers_info.store_id', storeId)
             .in('status', ['unpaid', 'partial', 'overdue'])
@@ -185,7 +185,7 @@ app.post('/api/credit-payments', creditPaymentValidators, async (req, res) => {
                 trans_date: new Date().toISOString().split('T')[0],
                 trans_type: 'income',
                 category: 'debt_payment',
-                description: `รับชำระหนี้ (ลูกค้าเก่า)`,
+                description: `รับชำระหนี้ - ${account.customers_info?.name || 'ลูกค้า'}`,
                 amount: toPay,
                 payment_method: payment_method,
                 reference_order_id: account.order_id
