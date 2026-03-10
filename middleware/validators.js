@@ -33,7 +33,7 @@ const categoryValidators = [
 const creditPaymentValidators = [
     body('customer_id').isString().notEmpty().withMessage('Customer ID required'), // Assuming UUID or String ID
     body('amount').isFloat({ gt: 0 }).withMessage('Amount must be greater than 0'),
-    body('payment_method').isIn(['cash', 'transfer']).withMessage('Invalid payment method'),
+    body('payment_method').isIn(['cash', 'transfer', 'qr', 'qr_promptpay']).withMessage('Invalid payment method'),
     validate
 ];
 
