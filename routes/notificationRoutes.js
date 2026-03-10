@@ -121,9 +121,11 @@ const registerNotificationRoutes = ({
                 customerDebts[customerId].total_debt += parseFloat(account.remaining_amount);
             }
 
-            const today = new Date();
-            const startOfDay = new Date(today);
-            startOfDay.setHours(0, 0, 0, 0);
+            const TH_OFFSET = 7 * 60 * 60 * 1000;
+            const nowTH = new Date(Date.now() + TH_OFFSET);
+            const thY = nowTH.getUTCFullYear(), thM = nowTH.getUTCMonth(), thD = nowTH.getUTCDate();
+            const today = new Date(Date.UTC(thY, thM, thD) - TH_OFFSET);
+            const startOfDay = today;
 
             // 4. Check each customer status
             for (const customerId in customerDebts) {
@@ -182,11 +184,11 @@ const registerNotificationRoutes = ({
 
     // Reusable function to process notifications for a SPECIFIC store
     const processStoreNotifications = async (storeId) => {
-        const today = new Date();
-        const todayStr = today.toISOString().split('T')[0];
-        const in3Days = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-        const in7Days = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-        const in2Days = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const TH_OFFSET_MS = 7 * 60 * 60 * 1000;
+        const todayStr = new Date(Date.now() + TH_OFFSET_MS).toISOString().split('T')[0];
+        const in2Days = new Date(Date.now() + TH_OFFSET_MS + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const in3Days = new Date(Date.now() + TH_OFFSET_MS + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const in7Days = new Date(Date.now() + TH_OFFSET_MS + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
         const results = {
             expired: 0,

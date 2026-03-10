@@ -437,7 +437,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     });
 
     const zeroStockList = products?.filter(p => parseFloat(p.stock_qty) <= 0).map(p => `${p.name} (0 ${p.unit_type || 'ชิ้น'})`) || [];
-    const monthNum = new Date().getMonth() + 1;
+    const monthNum = new Date(Date.now() + 7 * 60 * 60 * 1000).getUTCMonth() + 1;
     let season = 'Summer';
     if (monthNum >= 5 && monthNum <= 10) season = 'Rainy';
     else if (monthNum >= 11 || monthNum <= 2) season = 'Winter (Cool)';
@@ -491,8 +491,9 @@ const getStoreSummary = async (storeId, lat, lon) => {
 
     // Format Date Range
     const startOfMonthDate = new Date(startOfMonth);
-    const daysCount = new Date().getDate();
-    const dateRangeStr = `${startOfMonthDate.getDate()} - ${new Date().getDate()} ${new Date().toLocaleString('default', { month: 'short' })} (${daysCount} Days)`;
+    const nowTH = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const daysCount = nowTH.getUTCDate();
+    const dateRangeStr = `${startOfMonthDate.getUTCDate()} - ${daysCount} ${nowTH.toLocaleString('th-TH', { month: 'short', timeZone: 'Asia/Bangkok' })} (${daysCount} Days)`;
     const netProfitMonth = profitMonth - totalExpenses; // กำไรสุทธิจริงๆ!
 
     const contextText = `

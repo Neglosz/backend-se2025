@@ -131,8 +131,8 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                     orderNo: o.order_no,
                     customer: o.customers_info?.name || 'ลูกค้าทั่วไป',
                     amount: parseFloat(o.total_amount),
-                    time: new Date(o.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }),
-                    date: new Date(o.created_at).toLocaleDateString('th-TH'),
+                    time: new Date(o.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bangkok' }),
+                    date: new Date(o.created_at).toLocaleDateString('th-TH', { timeZone: 'Asia/Bangkok' }),
                     paymentStatus: o.payment_status,
                     paymentType: o.payment_type,
                     method: method // cash, qr, credit, other
@@ -260,12 +260,13 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
 
             const formatted = {
                 receiptNo: order.order_no,
-                date: new Date(order.created_at).toLocaleDateString('th-TH', {
+                date: new Date(order.created_at).toLocaleString('th-TH', {
                     year: 'numeric',
                     month: 'long',
                     day: 'numeric',
                     hour: '2-digit',
-                    minute: '2-digit'
+                    minute: '2-digit',
+                    timeZone: 'Asia/Bangkok'
                 }),
                 paymentMethod: paymentMethodDisplay,
                 items: order.order_items.map(item => ({
