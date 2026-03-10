@@ -359,7 +359,7 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                 customer: o.customers_info?.name || 'ลูกค้าทั่วไป',
                 amount: parseFloat(o.total_amount),
                 time: new Date(o.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bangkok' }),
-                date: new Date(o.created_at).toLocaleDateString('th-TH', { timeZone: 'Asia/Bangkok' })
+                date: new Date(o.created_at).toLocaleDateString('th-TH-u-ca-buddhist', { timeZone: 'Asia/Bangkok' })
             }));
 
             res.json({ success: true, data: formatted });
