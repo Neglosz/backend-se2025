@@ -1881,17 +1881,30 @@ router.post('/dispose-product', async (req, res) => {
             }
         }
 
-        // 2. For each product, find and dispose expired batches only
+        // 2. For each product, find and dispose batches
         // Track disposal per product so we can do the final update later
         const productDisposalMap = new Map(); // product.id -> { product, disposedQty }
 
         for (const product of products || []) {
-            const { data: batches } = await supabaseAdmin
+            // ลอง expired batches ก่อน (expire_date <= วันนี้)
+            const { data: expiredBatches } = await supabaseAdmin
                 .from('product_batches')
                 .select('id, batch_no, remaining_qty, expire_date')
                 .eq('product_id', product.id)
-                .lte('expire_date', todayBangkok) // Use <= to safely catch everything up to today
+                .not('expire_date', 'is', null)
+                .lte('expire_date', todayBangkok)
                 .gt('remaining_qty', 0);
+
+            // Fallback: ถ้าไม่มี expired batch ให้ตัด all remaining batches (เช่น สินค้าไม่มีวันหมดอายุ)
+            let batches = expiredBatches || [];
+            if (batches.length === 0) {
+                const { data: allBatches } = await supabaseAdmin
+                    .from('product_batches')
+                    .select('id, batch_no, remaining_qty, expire_date')
+                    .eq('product_id', product.id)
+                    .gt('remaining_qty', 0);
+                batches = allBatches || [];
+            }
 
             let disposedForProduct = 0;
 
@@ -1928,6 +1941,18 @@ router.post('/dispose-product', async (req, res) => {
                 });
             }
 
+            // Fallback สุดท้าย: ไม่มี batch เลยแต่ stock_qty > 0 (legacy data) — ตัด stock_qty ตรงๆ
+            if (batches.length === 0 && parseFloat(product.stock_qty) > 0) {
+                disposedForProduct = parseFloat(product.stock_qty);
+                totalDisposed += disposedForProduct;
+                disposedItems.push({
+                    productName: product.name,
+                    batchNo: null,
+                    qty: disposedForProduct,
+                    expireDate: null
+                });
+            }
+
             productDisposalMap.set(product.id, { product, disposedQty: disposedForProduct });
         }
 
@@ -1948,7 +1973,9 @@ router.post('/dispose-product', async (req, res) => {
                     status: 'accepted',
                     acted_at: new Date().toISOString(),
                     payload: enrichedPayload,
-                    actual_outcome: `ตัดสต็อก ${totalDisposed} ${products?.[0]?.unit_type || 'ชิ้น'} จาก ${disposedItems.length} batch`
+                    actual_outcome: totalDisposed > 0
+                        ? `ตัดสต็อก ${totalDisposed} ${products?.[0]?.unit_type || 'ชิ้น'} จาก ${disposedItems.length} รายการ`
+                        : 'ไม่พบสต็อกที่ต้องตัด (อาจถูกตัดไปแล้ว)'
                 })
                 .eq('id', targetRecId);
 
