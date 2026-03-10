@@ -185,7 +185,8 @@ const registerNotificationRoutes = ({
     // Reusable function to process notifications for a SPECIFIC store
     const processStoreNotifications = async (storeId) => {
         const TH_OFFSET_MS = 7 * 60 * 60 * 1000;
-        const todayStr = new Date(Date.now() + TH_OFFSET_MS).toISOString().split('T')[0];
+        const today = new Date(Date.now() + TH_OFFSET_MS);
+        const todayStr = today.toISOString().split('T')[0];
         const in2Days = new Date(Date.now() + TH_OFFSET_MS + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const in3Days = new Date(Date.now() + TH_OFFSET_MS + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const in7Days = new Date(Date.now() + TH_OFFSET_MS + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];

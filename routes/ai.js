@@ -491,7 +491,6 @@ const getStoreSummary = async (storeId, lat, lon) => {
 
     // Format Date Range
     const startOfMonthDate = new Date(startOfMonth);
-    const nowTH = new Date(Date.now() + 7 * 60 * 60 * 1000);
     const daysCount = nowTH.getUTCDate();
     const dateRangeStr = `${startOfMonthDate.getUTCDate()} - ${daysCount} ${nowTH.toLocaleString('th-TH', { month: 'short', timeZone: 'Asia/Bangkok' })} (${daysCount} Days)`;
     const netProfitMonth = profitMonth - totalExpenses; // กำไรสุทธิจริงๆ!
