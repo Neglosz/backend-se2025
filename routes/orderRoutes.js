@@ -146,7 +146,7 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
         }
     });
 
-    // Cancel Order (called when deleting a linked sales transaction)
+    // Cancel Order — set status to cancelled + restore stock
     app.patch('/api/orders/:id/cancel', async (req, res) => {
         try {
             const { id } = req.params;
@@ -156,6 +156,32 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
             if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
             if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
 
+            // Fetch order items to restore stock
+            const { data: orderItems, error: itemsError } = await supabaseAdmin
+                .from('order_items')
+                .select('product_id, qty')
+                .eq('order_id', id);
+
+            if (itemsError) throw itemsError;
+
+            // Restore stock for each product
+            for (const item of orderItems || []) {
+                if (!item.product_id) continue;
+                const { data: product } = await supabaseAdmin
+                    .from('products')
+                    .select('stock_qty')
+                    .eq('id', item.product_id)
+                    .single();
+
+                if (product) {
+                    await supabaseAdmin
+                        .from('products')
+                        .update({ stock_qty: product.stock_qty + item.qty })
+                        .eq('id', item.product_id);
+                }
+            }
+
+            // Mark order as cancelled
             const { error } = await supabaseAdmin
                 .from('orders')
                 .update({ payment_status: 'cancelled' })

@@ -117,10 +117,13 @@ const getWeatherData = async (lat, lon) => {
 
 // Helper to check store access (Simplified version of middleware)
 const getStoreSummary = async (storeId, lat, lon) => {
-    const now = new Date();
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    const thirtyDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30).toISOString();
+    // ใช้เวลาไทย UTC+7 ตรงกับ reportRoutes.js
+    const TH_OFFSET = 7 * 60 * 60 * 1000;
+    const nowTH = new Date(Date.now() + TH_OFFSET);
+    const thY = nowTH.getUTCFullYear(), thM = nowTH.getUTCMonth(), thD = nowTH.getUTCDate();
+    const startOfDay    = new Date(Date.UTC(thY, thM, thD)      - TH_OFFSET).toISOString();
+    const startOfMonth  = new Date(Date.UTC(thY, thM, 1)        - TH_OFFSET).toISOString();
+    const thirtyDaysAgo = new Date(Date.UTC(thY, thM, thD - 30) - TH_OFFSET).toISOString();
 
     // Fetch External Context (Weather & Location)
     const [weather, address] = await Promise.all([
@@ -132,7 +135,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     // 1. FETCH DATA (Optimized Parallel Requests)
     // ===================================================
 
-    // A. Orders & Items (Last 30 Days)
+    // A. Orders & Items (Last 30 Days) — exclude cancelled orders
     const { data: orders } = await supabaseAdmin
         .from('orders')
         .select(`
@@ -140,7 +143,8 @@ const getStoreSummary = async (storeId, lat, lon) => {
             order_items (qty, price_per_unit, cost_price_at_sale, subtotal, unit, products (id, name, unit_type))
         `)
         .eq('store_id', storeId)
-        .gte('created_at', thirtyDaysAgo);
+        .gte('created_at', thirtyDaysAgo)
+        .eq('payment_status', 'paid');
 
     // B. Current Stock
     const { data: products } = await supabaseAdmin
@@ -179,8 +183,8 @@ const getStoreSummary = async (storeId, lat, lon) => {
 
     // B2. ดึงสินค้าที่มี expire_date ภายใน 14 วันที่ผ่านมาถึง 14 วันข้างหน้า (ใช้ date-only แบบ Bangkok)
     // ใช้ date-only string ป้องกัน timezone mismatch (expire_date ใน DB เป็น date type ล้วน)
-    const bangkokOffset = 7 * 60 * 60 * 1000;
-    const nowBangkok = new Date(Date.now() + bangkokOffset);
+    const bangkokOffset = TH_OFFSET; // reuse constant defined above
+    const nowBangkok = nowTH;
     const todayDateStr = nowBangkok.toISOString().split('T')[0]; // YYYY-MM-DD ตาม Bangkok time
 
     const fourteenDaysLaterDate = new Date(nowBangkok);
@@ -298,12 +302,15 @@ const getStoreSummary = async (storeId, lat, lon) => {
     // New: Monthly Product Stats
     const productStatsMonth = {}; // { pid: { name, qty, revenue } }
 
-    const todayStr = new Date().toISOString().split('T')[0];
+    // todayStr ใช้ Bangkok time เหมือน reportRoutes.js
+    const todayStr = `${thY}-${String(thM + 1).padStart(2, '0')}-${String(thD).padStart(2, '0')}`;
 
     orders?.forEach(order => {
         const d = new Date(order.created_at);
-        const dStr = d.toISOString().split('T')[0];
-        const dayName = days[d.getDay()];
+        // แปลง timestamp เป็น Bangkok date string เพื่อเปรียบเทียบ
+        const dTH = new Date(d.getTime() + TH_OFFSET);
+        const dStr = dTH.toISOString().split('T')[0];
+        const dayName = days[dTH.getUTCDay()];
         const total = parseFloat(order.total_amount) || 0;
         const isThisMonth = d >= new Date(startOfMonth);
 
@@ -315,7 +322,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
         if (dStr === todayStr) salesToday += total;
 
         weeklySales[dayName] += total;
-        const hour = d.getHours();
+        const hour = dTH.getUTCHours();
         hourlyTraffic[hour] = (hourlyTraffic[hour] || 0) + 1;
 
         let orderCost = 0;
