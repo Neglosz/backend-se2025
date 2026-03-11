@@ -50,7 +50,8 @@ const createNotificationService = ({ supabaseAdmin }) => {
                                 payload,
                                 priority,
                                 is_read: false, // Reset to unread because info changed
-                                created_at: new Date().toISOString() // Bump to top because info changed
+                                // NOTE: Do NOT update created_at — changing it triggers Realtime
+                                // and causes an infinite UPDATE loop on the frontend
                             })
                             .eq('id', existing.id);
                         createdCount++;
