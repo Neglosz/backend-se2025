@@ -265,18 +265,22 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
 
             const { start, end } = getDateRange(period);
 
-            // 1. Fetch payments (เงินสด + QR ที่จ่ายจริงแล้ว)
+            // 1. Fetch payments (เงินสด + QR) โดย join orders เพื่อ filter ตาม orders.created_at
+            // ใช้ orders.created_at ไม่ใช่ payments.paid_at
+            // เพื่อป้องกันการนับการจ่ายหนี้จากวันก่อนหน้ารวมในยอดวันนี้
             const { data: payments, error } = await supabaseAdmin
                 .from('payments')
                 .select(`
-        amount,
-        method,
-        orders!inner(store_id)
-    `)
+                    amount,
+                    method,
+                    orders!inner(store_id, created_at, payment_status)
+                `)
                 .eq('orders.store_id', storeId)
-                .gte('paid_at', start)
-                .lte('paid_at', end);
+                .neq('orders.payment_status', 'cancelled')
+                .gte('orders.created_at', start)
+                .lte('orders.created_at', end);
             if (error) throw error;
+
             // 2. Fetch credit_accounts ที่ยังค้างอยู่ ดึง remaining_amount (ไม่ใช่ total_amount)
             // เพื่อกัน double count กรณี partial payment
             const { data: creditAccounts, error: creditError } = await supabaseAdmin
@@ -290,13 +294,15 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                 .gte('orders.created_at', start)
                 .lte('orders.created_at', end);
             if (creditError) throw creditError;
+
             const stats = {
                 cash: 0,
                 qr: 0,
                 credit: 0
             };
             let total = 0;
-            // นับจาก payments (เงินสด + QR)
+
+            // นับจาก payments (เงินสด + QR) ที่ order เกิดในช่วงเวลาที่เลือก
             payments.forEach(p => {
                 const amount = parseFloat(p.amount) || 0;
                 total += amount;
@@ -304,6 +310,7 @@ const registerReportRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                 else if (p.method === 'qr_promptpay') stats.qr += amount;
                 else if (p.method === 'credit') stats.credit += amount;
             });
+
             // นับจาก credit_accounts (เฉพาะยอดค้างจริง remaining_amount)
             creditAccounts.forEach(ca => {
                 const amount = parseFloat(ca.remaining_amount) || 0;
