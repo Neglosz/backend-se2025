@@ -28,7 +28,7 @@ const registerProductRoutes = ({
 
             let query = supabaseAdmin
                 .from('products')
-                .select('id, barcode, name, price, cost_price, stock_qty, image_url, category_id, is_weightable, unit_type')
+                .select('id, barcode, name, price, cost_price, stock_qty, image_url, category_id, is_weightable, unit_type, product_categories(id, name)')
                 .order('name', { ascending: true })
                 .eq('store_id', storeId)
                 .is('deleted_at', null);
