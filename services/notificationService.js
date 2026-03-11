@@ -21,44 +21,68 @@ const createNotificationService = ({ supabaseAdmin }) => {
         }
     };
 
-    // Global Helper: Upsert Notification (Smart Update - Production Grade)
+    // Global Helper: Upsert Notification (Production Grade — supports state transitions)
+    //
+    // Matches by (reference_id + reference_type + user_id), NOT by type.
+    // This allows in-place update when a notification changes state:
+    //   e.g. stock_near_expiry → stock_expired for the same batch
+    // The existing notification is updated with the new type/title/message instead of
+    // creating a duplicate, giving the user a single, always-accurate alert per item.
     const upsertNotificationGlobal = async (storeId, type, title, message, category, priority, referenceId, referenceType, payload) => {
         try {
             const userIds = await getStoreUsers(storeId);
             let createdCount = 0;
 
             for (const userId of userIds) {
-                // Check for existing notification (same type + same reference for this user)
-                // Fetch title and message to compare
-                const { data: existing } = await supabaseAdmin
+                // Find existing notification by reference (any type) — supports state transitions
+                // Use .limit(1) instead of .maybeSingle() to safely handle rare duplicate rows
+                // from concurrent scheduler runs. maybeSingle() throws if >1 row found,
+                // which would crash the entire notification pipeline silently.
+                const { data: existingRows } = await supabaseAdmin
                     .from('notifications')
-                    .select('id, title, message')
+                    .select('id, type, title, message')
                     .eq('user_id', userId)
-                    .eq('type', type)
                     .eq('reference_id', referenceId)
                     .eq('reference_type', referenceType)
-                    .maybeSingle();
+                    .order('created_at', { ascending: false })
+                    .limit(1);
+                const existing = existingRows?.[0] || null;
 
                 if (existing) {
-                    // Only update if content HAS CHANGED
-                    if (existing.title !== title || existing.message !== message) {
+                    // Self-heal: delete any duplicate rows that may exist from past race conditions
+                    // (keep only the one we're about to update — the most recent one)
+                    await supabaseAdmin
+                        .from('notifications')
+                        .delete()
+                        .eq('user_id', userId)
+                        .eq('reference_id', referenceId)
+                        .eq('reference_type', referenceType)
+                        .neq('id', existing.id); // keep this one, delete the rest
+
+                    // Check if anything changed (type OR content)
+                    const typeChanged = existing.type !== type;
+                    const contentChanged = existing.title !== title || existing.message !== message;
+
+                    if (typeChanged || contentChanged) {
+                        // Update in-place — preserves the notification row, just changes its state
                         await supabaseAdmin
                             .from('notifications')
                             .update({
+                                type,       // ← also update type (near_expiry → expired)
                                 title,
                                 message,
                                 payload,
                                 priority,
-                                is_read: false, // Reset to unread because info changed
-                                // NOTE: Do NOT update created_at — changing it triggers Realtime
-                                // and causes an infinite UPDATE loop on the frontend
+                                category,
+                                is_read: false, // Reset to unread — new information
+                                // NOTE: Do NOT update created_at — triggers Realtime loop
                             })
                             .eq('id', existing.id);
                         createdCount++;
                     }
-                    // If content is same, do NOTHING. Preserves original created_at and is_read status.
+                    // Content unchanged → do nothing (preserve is_read and created_at)
                 } else {
-                    // Insert new
+                    // No existing notification — insert fresh
                     await supabaseAdmin.from('notifications').insert([{
                         store_id: storeId,
                         user_id: userId,
