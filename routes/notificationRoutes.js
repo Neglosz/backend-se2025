@@ -374,10 +374,15 @@ const registerNotificationRoutes = ({
                 .eq('store_id', storeId)
                 .in('type', ['stock_expired', 'stock_near_expiry', 'payment_overdue', 'payment_due_soon', 'stock_low', 'stock_out']);
 
-            const activeBatchIds = new Set([
-                ...(expiredBatches || []).map(b => b.id),
-                ...(nearExpiryBatches || []).map(b => b.id)
-            ]);
+            // Type-specific sets for accurate auto-resolve
+            // Must be separate — when batch transitions near-expiry→expired:
+            //   - stock_expired  → only valid if batch is in expiredBatches
+            //   - stock_near_expiry → only valid if batch is still in nearExpiryBatches
+            // Note: upsertNotificationGlobal transitions type in-place, so normally
+            // there won't be a stale stock_near_expiry when batch is expired.
+            // This is a safety net for edge cases.
+            const activeExpiredBatchIds = new Set((expiredBatches || []).map(b => b.id));
+            const activeNearExpiryBatchIds = new Set((nearExpiryBatches || []).map(b => b.id));
             const activeCustomerIds = new Set(Object.keys(customerGroup));
 
             // For stock_low and stock_out, we need to check current stock levels
@@ -401,8 +406,14 @@ const registerNotificationRoutes = ({
             for (const notif of activeNotifs || []) {
                 let isResolved = false;
 
-                if (notif.type === 'stock_expired' || notif.type === 'stock_near_expiry') {
-                    if (!activeBatchIds.has(notif.reference_id)) isResolved = true;
+                if (notif.type === 'stock_expired') {
+                    // Resolved if batch is no longer expired (e.g. batch was deleted/sold out)
+                    if (!activeExpiredBatchIds.has(notif.reference_id)) isResolved = true;
+                } else if (notif.type === 'stock_near_expiry') {
+                    // Resolved if batch is no longer near-expiry AND not expired
+                    // (near-expiry transitions to expired via upsert — this catches orphaned ones)
+                    if (!activeNearExpiryBatchIds.has(notif.reference_id) &&
+                        !activeExpiredBatchIds.has(notif.reference_id)) isResolved = true;
                 } else if (notif.type === 'payment_overdue' || notif.type === 'payment_due_soon') {
                     if (!activeCustomerIds.has(notif.reference_id)) isResolved = true;
                 } else if (notif.type === 'stock_low' || notif.type === 'stock_out') {
@@ -450,7 +461,7 @@ const registerNotificationRoutes = ({
             // 9. Auto-purge empty batches older than 2 years (Data Archiving)
             const twoYearsAgo = new Date();
             twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-            
+
             // Note: product_batches doesn't have store_id directly, so we join with products to filter by storeId
             const { data: oldBatches } = await supabaseAdmin
                 .from('product_batches')
@@ -462,14 +473,14 @@ const registerNotificationRoutes = ({
 
             if (oldBatches && oldBatches.length > 0) {
                 const batchIds = oldBatches.map(b => b.id);
-                
+
                 // Set batch_id to NULL to prevent breaking order history and inventory transactions
                 await supabaseAdmin.from('order_items').update({ batch_id: null }).in('batch_id', batchIds);
                 await supabaseAdmin.from('inventory_transactions').update({ batch_id: null }).in('batch_id', batchIds);
-                
+
                 // Safely delete empty batches
                 await supabaseAdmin.from('product_batches').delete().in('id', batchIds);
-                
+
                 results.cleaned += batchIds.length;
             }
 
