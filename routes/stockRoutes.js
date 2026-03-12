@@ -128,10 +128,12 @@ const registerStockRoutes = ({
                     name,
                     image_url,
                     store_id,
-                    unit_type
+                    unit_type,
+                    deleted_at
                 )
             `)
                 .eq('products.store_id', storeId)
+                .is('products.deleted_at', null)
                 .lt('expire_date', today)
                 .gt('remaining_qty', 0)
                 .order('expire_date', { ascending: true })
@@ -229,10 +231,12 @@ const registerStockRoutes = ({
                     name,
                     image_url,
                     store_id,
-                    unit_type
+                    unit_type,
+                    deleted_at
                 )
             `)
                 .eq('products.store_id', storeId)
+                .is('products.deleted_at', null)
                 .gte('expire_date', today)
                 .lte('expire_date', expireLimit)
                 .gt('remaining_qty', 0)
@@ -350,6 +354,7 @@ const registerStockRoutes = ({
                 products!inner(id, name, store_id)
             `)
                 .eq('products.store_id', storeId)
+                .is('products.deleted_at', null)
                 .lt('expire_date', todayStr)
                 .gt('remaining_qty', 0);
 
