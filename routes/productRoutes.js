@@ -235,6 +235,31 @@ const registerProductRoutes = ({
         }
     });
 
+    // Get single product by ID
+    app.get('/api/products/:id', async (req, res) => {
+        try {
+            const { id } = req.params;
+            const storeId = req.headers['x-store-id'];
+            const userId = req.user.id;
+            if (!storeId) return res.status(400).json({ success: false, error: 'Missing store ID' });
+
+            const hasAccess = await checkStoreAccess(userId, storeId);
+            if (!hasAccess) return res.status(403).json({ success: false, error: 'Unauthorized' });
+
+            const { data, error } = await supabaseAdmin
+                .from('products')
+                .select('*')
+                .eq('id', id)
+                .eq('store_id', storeId)
+                .single();
+
+            if (error || !data) return res.status(404).json({ success: false, error: 'Product not found' });
+            res.json({ success: true, data });
+        } catch (error) {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    });
+
     // Add stock to existing product (create new batch)
     app.post('/api/products/:id/add-batch', async (req, res) => {
         try {
