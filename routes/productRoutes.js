@@ -108,7 +108,13 @@ const registerProductRoutes = ({
                                 const discountAmt = parseFloat(promo.discount_value);
                                 p.price = Math.max(0, p.price - discountAmt);
                             } else if (promo.type === 'bundle') {
-                                //Bundle: price stay same, logic in cart
+                                if (!promo.min_spend) {
+                                    // No min_spend: discount_value is a percent (as set by AI)
+                                    const discountPct = parseFloat(promo.discount_value);
+                                    p.discount_percent = discountPct;
+                                    p.price = Math.round(p.price * (1 - discountPct / 100));
+                                }
+                                // else: price stays same, fixed-amount discount applied at checkout
                             }
                         } else {
                             p.is_promotion = false;
@@ -201,7 +207,12 @@ const registerProductRoutes = ({
                 } else if (p.type === 'discount_amount') {
                     finalPrice = Math.max(0, data.price - parseFloat(p.discount_value));
                 } else if (p.type === 'bundle') {
-                    //Bundle: price same, discount at checkout
+                    if (!p.min_spend) {
+                        // No min_spend: discount_value is a percent (as set by AI)
+                        discountPercent = parseFloat(p.discount_value);
+                        finalPrice = Math.round(data.price * (1 - discountPercent / 100));
+                    }
+                    // else: price same, fixed-amount discount applied at checkout
                 }
 
                 promotion = {
