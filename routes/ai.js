@@ -2109,7 +2109,7 @@ router.post('/ocr-expiry', async (req, res) => {
         }
 
         // Use gemini-2.5-flash for accurate and fast multimodal OCR
-        const visionModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const visionModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
 
         const prompt = `
         You are a highly accurate OCR system. Look at the provided image, which contains a product label, expiration date, or manufacturing date.
