@@ -108,13 +108,8 @@ const registerProductRoutes = ({
                                 const discountAmt = parseFloat(promo.discount_value);
                                 p.price = Math.max(0, p.price - discountAmt);
                             } else if (promo.type === 'bundle') {
-                                if (!promo.min_spend) {
-                                    // No min_spend: discount_value is a percent (as set by AI)
-                                    const discountPct = parseFloat(promo.discount_value);
-                                    p.discount_percent = discountPct;
-                                    p.price = Math.round(p.price * (1 - discountPct / 100));
-                                }
-                                // else: price stays same, fixed-amount discount applied at checkout
+                                // Price stays same — discount applied at cart level
+                                // only when ALL bundle partners are present in cart
                             }
                         } else {
                             p.is_promotion = false;
@@ -207,12 +202,8 @@ const registerProductRoutes = ({
                 } else if (p.type === 'discount_amount') {
                     finalPrice = Math.max(0, data.price - parseFloat(p.discount_value));
                 } else if (p.type === 'bundle') {
-                    if (!p.min_spend) {
-                        // No min_spend: discount_value is a percent (as set by AI)
-                        discountPercent = parseFloat(p.discount_value);
-                        finalPrice = Math.round(data.price * (1 - discountPercent / 100));
-                    }
-                    // else: price same, fixed-amount discount applied at checkout
+                    // Price stays same — discount applied at cart level
+                    // only when ALL bundle partners are present in cart
                 }
 
                 promotion = {
