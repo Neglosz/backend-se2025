@@ -2100,4 +2100,46 @@ router.get('/scheduled-reminders', async (req, res) => {
     }
 });
 
+// POST /api/ai/ocr-expiry - Extract expiration date from image
+router.post('/ocr-expiry', async (req, res) => {
+    try {
+        const { imageBase64 } = req.body;
+        if (!imageBase64) {
+            return res.status(400).json({ success: false, error: 'Image base64 is required' });
+        }
+
+        // Use gemini-2.5-flash for accurate and fast multimodal OCR
+        const visionModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+        const prompt = `
+        You are a highly accurate OCR system. Look at the provided image, which contains a product label, expiration date, or manufacturing date.
+        Your task is to find the EXPIRATION DATE (EXP, EXD, BB, BBE, หมดอายุ, ควรบริโภคก่อน, etc.).
+        Pay attention to Thai Buddhist Era (BE) years. If the year is > 2500, it's BE. Subtract 543 to get the Gregorian year.
+        If there's only a Manufacturing Date (MFG, MFD, ผลิต), do NOT return it as expiration date unless you can deduce the expiry.
+        Return the result in EXACTLY ISO format: YYYY-MM-DD.
+        If you cannot find an expiration date with high confidence, respond exactly with "NOT_FOUND".
+        Do not include any other text, explanation, or markdown. Just the date or "NOT_FOUND".
+        `;
+
+        const imagePart = {
+            inlineData: {
+                data: imageBase64,
+                mimeType: "image/jpeg"
+            },
+        };
+
+        const result = await visionModel.generateContent([prompt, imagePart]);
+        const text = result.response.text().trim();
+
+        if (text === "NOT_FOUND" || !/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+            return res.json({ success: false, error: 'ไม่พบวันหมดอายุในรูปภาพ หรือภาพไม่ชัดเจน' });
+        }
+
+        res.json({ success: true, date: text });
+    } catch (error) {
+        console.error('OCR Expiry Error:', error);
+        res.status(500).json({ success: false, error: 'เกิดข้อผิดพลาดในการวิเคราะห์รูปภาพ' });
+    }
+});
+
 module.exports = router;
