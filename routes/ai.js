@@ -1529,7 +1529,7 @@ router.get('/recommendations/stats', async (req, res) => {
             .select('id, status, actual_amount, type, payload, acted_at, created_at')
             .eq('store_id', storeId)
             .neq('status', 'pending')
-            .gte('created_at', startDate.toISOString());
+            .gte('acted_at', startDate.toISOString());
 
         if (periodError) throw periodError;
 
@@ -1791,7 +1791,7 @@ router.post('/apply-promotion', async (req, res) => {
 
         if (itemsError) throw itemsError;
 
-        // 5. Update recommendation status if provided
+        // 5. Update recommendation status if provided, or insert new record for chat-sourced actions
         if (recommendationId) {
             const { data: rec } = await supabaseAdmin
                 .from('ai_recommendations')
@@ -1813,6 +1813,21 @@ router.post('/apply-promotion', async (req, res) => {
                 .eq('id', recommendationId)
                 .select()
                 .maybeSingle();
+        } else {
+            // Chat-sourced action: insert a new record so it appears in history/stats
+            await supabaseAdmin
+                .from('ai_recommendations')
+                .insert([{
+                    store_id: storeId,
+                    user_id: userId,
+                    type: 'promotion',
+                    title: promoName,
+                    detail: `โปรโมชั่นจาก AI Chat`,
+                    status: 'accepted',
+                    acted_at: new Date().toISOString(),
+                    payload: { affected_product_ids: products.map(p => p.id) },
+                    actual_outcome: `สร้างโปรโมชั่น ${promoName} สำหรับ ${products.length} สินค้า`
+                }]);
         }
 
         res.json({
@@ -1956,7 +1971,7 @@ router.post('/dispose-product', async (req, res) => {
             productDisposalMap.set(product.id, { product, disposedQty: disposedForProduct });
         }
 
-        // 3. Update recommendation status FIRST
+        // 3. Update recommendation status FIRST, or insert new record for chat-sourced actions
         if (targetRecId) {
             const { data: rec } = await supabaseAdmin
                 .from('ai_recommendations')
@@ -1982,6 +1997,24 @@ router.post('/dispose-product', async (req, res) => {
             if (updErr) {
                 console.error("Failed to update AI recommendation in dispose-product:", updErr);
             }
+        } else {
+            // Chat-sourced action: insert a new record so it appears in history/stats
+            const productNames = products.map(p => p.name).join(', ');
+            await supabaseAdmin
+                .from('ai_recommendations')
+                .insert([{
+                    store_id: storeId,
+                    user_id: userId,
+                    type: 'expiry',
+                    title: `ตัดสต็อก: ${productNames}`,
+                    detail: `ตัดสต็อกสินค้าจาก AI Chat`,
+                    status: 'accepted',
+                    acted_at: new Date().toISOString(),
+                    payload: { affected_product_ids: products.map(p => p.id) },
+                    actual_outcome: totalDisposed > 0
+                        ? `ตัดสต็อก ${totalDisposed} ${products?.[0]?.unit_type || 'ชิ้น'} จาก ${disposedItems.length} รายการ`
+                        : 'ไม่พบสต็อกที่ต้องตัด (อาจถูกตัดไปแล้ว)'
+                }]);
         }
 
         // 4. Update stock_qty ONLY. Do not soft-delete the product from the catalog!
