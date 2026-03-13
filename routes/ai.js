@@ -1512,24 +1512,31 @@ router.get('/recommendations/stats', async (req, res) => {
 
         if (!storeId || !userId) return res.status(400).json({ success: false, error: 'Store and User ID required' });
 
-        // revenueStartDate = exact start of the selected period (for sales queries)
-        let revenueStartDate = new Date();
-        revenueStartDate.setHours(0, 0, 0, 0);
+        // Use Thai timezone (UTC+7) for all date boundaries
+        const TH_OFFSET = 7 * 60 * 60 * 1000;
+        const nowTH = new Date(Date.now() + TH_OFFSET);
+        const thY = nowTH.getUTCFullYear(), thM = nowTH.getUTCMonth(), thD = nowTH.getUTCDate();
+        const thDow = nowTH.getUTCDay() || 7; // 1=Mon ... 7=Sun
+
+        // revenueStartDate = exact start of the selected period in Thai time
+        let revenueStartDate;
         if (period === 'month') {
-            revenueStartDate.setDate(1);
+            revenueStartDate = new Date(Date.UTC(thY, thM, 1) - TH_OFFSET);
         } else if (period === 'week') {
-            const day = revenueStartDate.getDay() || 7;
-            if (day !== 1) revenueStartDate.setHours(-24 * (day - 1));
+            revenueStartDate = new Date(Date.UTC(thY, thM, thD - (thDow - 1)) - TH_OFFSET);
+        } else {
+            // 'today': midnight Bangkok time
+            revenueStartDate = new Date(Date.UTC(thY, thM, thD) - TH_OFFSET);
         }
-        // period === 'today': stays at today 00:00
 
         // recStartDate = wider window to fetch relevant recommendations
         // (promotions last multiple days, so yesterday's rec can still earn money today)
-        let recStartDate = new Date(revenueStartDate);
+        let recStartDate;
         if (period === 'today') {
             // also include recs acted on this week so promo effects are visible
-            const day = recStartDate.getDay() || 7;
-            if (day !== 1) recStartDate.setHours(-24 * (day - 1));
+            recStartDate = new Date(Date.UTC(thY, thM, thD - (thDow - 1)) - TH_OFFSET);
+        } else {
+            recStartDate = new Date(revenueStartDate);
         }
 
         const { data: periodData, error: periodError } = await supabaseAdmin
