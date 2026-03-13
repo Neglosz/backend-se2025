@@ -1512,16 +1512,24 @@ router.get('/recommendations/stats', async (req, res) => {
 
         if (!storeId || !userId) return res.status(400).json({ success: false, error: 'Store and User ID required' });
 
-        // Calculate start date based on period
-        let startDate = new Date();
-        startDate.setHours(0, 0, 0, 0);
+        // revenueStartDate = exact start of the selected period (for sales queries)
+        let revenueStartDate = new Date();
+        revenueStartDate.setHours(0, 0, 0, 0);
+        if (period === 'month') {
+            revenueStartDate.setDate(1);
+        } else if (period === 'week') {
+            const day = revenueStartDate.getDay() || 7;
+            if (day !== 1) revenueStartDate.setHours(-24 * (day - 1));
+        }
+        // period === 'today': stays at today 00:00
+
+        // recStartDate = wider window to fetch relevant recommendations
+        // (promotions last multiple days, so yesterday's rec can still earn money today)
+        let recStartDate = new Date(revenueStartDate);
         if (period === 'today') {
-            // Already set to today start
-        } else if (period === 'month') {
-            startDate.setDate(1);
-        } else { // default to week
-            const day = startDate.getDay() || 7; // Get current day number, make Sunday (0) become 7
-            if (day !== 1) startDate.setHours(-24 * (day - 1)); // Adjust to previous Monday
+            // also include recs acted on this week so promo effects are visible
+            const day = recStartDate.getDay() || 7;
+            if (day !== 1) recStartDate.setHours(-24 * (day - 1));
         }
 
         const { data: periodData, error: periodError } = await supabaseAdmin
@@ -1529,18 +1537,52 @@ router.get('/recommendations/stats', async (req, res) => {
             .select('id, status, actual_amount, type, payload, acted_at, created_at')
             .eq('store_id', storeId)
             .neq('status', 'pending')
-            .gte('acted_at', startDate.toISOString());
+            .gte('acted_at', recStartDate.toISOString());
 
         if (periodError) throw periodError;
 
-        // Sync real money explicitly for memory
+        // Sync cumulative actual_amount to DB (for history use)
         await syncRealMoneyEarned(storeId, periodData);
+
+        // Calculate period-specific moneyEarned: sales of AI promo products during this period only
+        // This gives "how much did AI help you earn TODAY/THIS WEEK/THIS MONTH"
+        const accepted = periodData?.filter(r => r.status === 'accepted') || [];
+        const allProductIds = [...new Set(accepted.flatMap(r => r.payload?.affected_product_ids || []))];
+        const allCustomerIds = [...new Set(accepted.flatMap(r => r.payload?.affected_customer_ids || []))];
+
+        let periodMoneyEarned = 0;
+
+        if (allProductIds.length > 0) {
+            const { data: sales } = await supabaseAdmin
+                .from('order_items')
+                .select('subtotal, orders!inner(payment_status)')
+                .in('product_id', allProductIds)
+                .eq('orders.store_id', storeId)
+                .in('orders.payment_status', ['paid', 'partial'])
+                .gte('orders.created_at', revenueStartDate.toISOString());
+            periodMoneyEarned += (sales || []).reduce((sum, r) => sum + (parseFloat(r.subtotal) || 0), 0);
+        }
+
+        if (allCustomerIds.length > 0) {
+            const { data: creditAccs } = await supabaseAdmin
+                .from('credit_accounts')
+                .select('order_id')
+                .in('customer_id', allCustomerIds);
+            if (creditAccs?.length > 0) {
+                const { data: payments } = await supabaseAdmin
+                    .from('payments')
+                    .select('amount')
+                    .in('order_id', creditAccs.map(a => a.order_id))
+                    .gte('paid_at', revenueStartDate.toISOString());
+                periodMoneyEarned += (payments || []).reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+            }
+        }
+
+        const moneyEarned = Math.round(periodMoneyEarned);
 
         // Calculate stats
         const totalRecommendations = periodData?.length || 0;
-        const accepted = periodData?.filter(r => r.status === 'accepted') || [];
         const followedCount = accepted.length;
-        const moneyEarned = accepted.reduce((sum, r) => sum + (parseFloat(r.actual_amount) || 0), 0);
 
         // Type breakdown
         const byType = {
