@@ -3,7 +3,6 @@ const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const path = require('path');
-const { error } = require('console');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 // ═══════════════════════════════════════════════════════════
@@ -42,6 +41,46 @@ const fuzzyScore = (query, target) => {
 };
 
 /**
+ * Round a suggested shelf price to the nearest multiple of 5, never below 5.
+ * Returns null for anything that is not a usable positive number.
+ */
+const roundPriceTo5 = (value) => {
+    const v = parseFloat(value);
+    if (!Number.isFinite(v) || v <= 0) return null;
+    return Math.max(5, Math.round(v / 5) * 5);
+};
+
+/**
+ * Resolve the product names the model returned against a list of real products.
+ *
+ * Exact name wins outright. Only when nothing matches exactly does this fall back to
+ * substring matching, and even then it keeps the single closest candidate per queried
+ * name — a plain `a.includes(b) || b.includes(a)` sweep would match both "นม" and
+ * "นมสด" and the caller would then quote whichever landed first.
+ */
+const matchProductsByName = (sourceList, targetNames) => {
+    const list = Array.isArray(sourceList) ? sourceList : [];
+    const names = Array.isArray(targetNames) ? targetNames : [];
+    if (names.length === 0 || list.length === 0) return [];
+
+    const norm = (s) => String(s || '').trim().toLowerCase();
+
+    const exact = list.filter(p => names.some(n => norm(p.name) === norm(n)));
+    if (exact.length > 0) return exact;
+
+    const chosen = new Map();
+    for (const name of names) {
+        const candidates = list.filter(p => norm(p.name).includes(norm(name)) || norm(name).includes(norm(p.name)));
+        if (candidates.length === 0) continue;
+        // "Closest" = the name whose length is nearest the queried one, so "นมสด"
+        // beats "นมสดพาสเจอร์ไรส์รสจืด" when the model asked for "นมสด".
+        candidates.sort((a, b) => Math.abs(a.name.length - name.length) - Math.abs(b.name.length - name.length));
+        chosen.set(candidates[0].name, candidates[0]);
+    }
+    return [...chosen.values()];
+};
+
+/**
  * fuzzyMatchProducts: รับ productNames[] (จาก AI) และ allProducts[] (จาก DB)
  * คืน products ที่ตรงหรือใกล้เคียงที่สุด (score >= threshold)
  * ใช้เป็น fallback เมื่อ ilike ไม่เจอผลลัพธ์
@@ -49,7 +88,9 @@ const fuzzyScore = (query, target) => {
 const fuzzyMatchProducts = (productNames, allProducts, threshold = 0.45) => {
     const results = new Map(); // id → product (dedup)
     for (const name of productNames) {
-        let best = null, bestScore = 0;
+        // Start below zero so a genuine zero score can still win when the caller
+        // lowers the threshold; starting at 0 made threshold:0 match nothing.
+        let best = null, bestScore = -1;
         for (const p of allProducts) {
             const score = fuzzyScore(name, p.name);
             if (score > bestScore) { bestScore = score; best = p; }
@@ -64,7 +105,7 @@ const fuzzyMatchProducts = (productNames, allProducts, threshold = 0.45) => {
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash-lite" });
 
 // Admin client for backend operations
 const supabaseAdmin = createClient(
@@ -80,11 +121,13 @@ const getRealAddress = async (lat, lon) => {
             headers: { 'User-Agent': 'SE2025-POS-App' } // Required by Nominatim policy
         });
         const data = await response.json();
-        const addr = data.address;
-        // Construct a concise address (District, City)
+        const addr = data.address || {};
+        // Construct a concise address (District, City). Joining only the parts that
+        // exist matters: `${''}, ${''}`.trim() is "," — truthy — so the old version
+        // could never fall back to "Thailand".
         const district = addr.suburb || addr.district || addr.city_district || "";
         const city = addr.city || addr.town || addr.province || "";
-        return `${district}, ${city}`.trim() || "Thailand";
+        return [district, city].filter(Boolean).join(', ') || "Thailand";
     } catch (e) {
         console.error("Geocoding Error:", e);
         return "Thailand";
@@ -675,7 +718,7 @@ ${data.context}
 
         // Initialize model per request to inject specific system instruction
         const chatModel = genAI.getGenerativeModel({
-            model: "gemini-2.5-flash-lite",
+            model: "gemini-3.5-flash-lite",
             systemInstruction: systemInstruction
         });
 
@@ -792,7 +835,7 @@ router.get('/recommendations', async (req, res) => {
         const data = await getStoreSummary(storeId, lat, lon);
 
         // Generate exactly 5 recommendations since we only do this once per day now
-        const targetGenerationCount = 5;
+        const targetGenerationCount = 6;
 
         // Collect target_products from existing pending recommendations to avoid duplication
         const alreadyRecommendedProducts = [];
@@ -814,7 +857,7 @@ ${activePromoNames.length > 0 ? `\n🚫 สินค้าที่มีโป�
 
 คุณคือ "ผู้จัดการร้านมืออาชีพ" ที่เข้าใจร้านโชห่วยไทยอย่างลึกซึ้ง
 คุณรู้ทุกอย่างเกี่ยวกับร้านนี้ — ยอดขาย สต็อก ลูกหนี้ สินค้าใกล้หมดอายุ สภาพอากาศ ฤดูกาล
-หน้าที่ของคุณคือ ให้คำแนะนำจำนวน 5 ข้อแบบเป๊ะๆ ที่ส่งผลกระทบต่อรายได้ร้านมากที่สุด
+หน้าที่ของคุณคือ ให้คำแนะนำจำนวน 6 ข้อ ที่ส่งผลกระทบต่อรายได้ร้านมากที่สุด (ระบบจะคัดเหลือ 5 ข้อที่ไม่ซ้ำสินค้าเอง — ข้อที่ 6 คือตัวสำรองเผื่อมีข้อไหนถูกตัด)
 
 📌 ลำดับความสำคัญ (เรียงจากสำคัญสุด):
   A. 🚨 ด่วน — สินค้าหมดอายุแล้ว/ใกล้หมดอายุ (ทุกวันที่ไม่ทำ = เสียเงินจริง)
@@ -822,7 +865,7 @@ ${activePromoNames.length > 0 ? `\n🚫 สินค้าที่มีโป�
   C. 📦 สต็อกขายดีใกล้หมด (ดึงจาก REORDER SOON และแจ้งยอดที่ "ควรสั่งเพิ่มด่วน")
   D. 💡 กลยุทธ์การขาย/ปรับราคา (ดึงจาก TRENDS & PRICING STRATEGY เช่น ปรับราคาขึ้นสำหรับของที่กำไรบาง หรือจัดโปรของที่กำไรงาม)
 
-สร้างคำแนะนำ 5 ข้อในรูปแบบ JSON array เรียงตามลำดับความสำคัญ (ต้องมีครบ 5 ข้อ ห้ามขาดห้ามเกิน):
+สร้างคำแนะนำ 6 ข้อในรูปแบบ JSON array เรียงตามลำดับความสำคัญ (ต้องมีครบ 6 ข้อ ห้ามขาดห้ามเกิน — สินค้าห้ามซ้ำกันทั้ง 6 ข้อ):
 
 [
   {
@@ -863,7 +906,7 @@ ${activePromoNames.length > 0 ? `\n🚫 สินค้าที่มีโป�
 
 1. **เรียงตามลำดับความสำคัญ**:
    - ข้อ 1 = สำคัญที่สุด ต้องทำก่อน (เช่น สินค้าหมดอายุแล้ว)
-   - ข้อ 5 = สำคัญน้อยสุดในห้าข้อ (เช่น โปรโมชั่นเพิ่มยอด)
+   - ข้อ 6 = สำคัญน้อยสุด (เช่น โปรโมชั่นเพิ่มยอด) ใช้เป็นตัวสำรอง
    - ถ้าไม่มีเรื่องด่วน ให้แนะนำกลยุทธ์เพิ่มยอดขายแทน
 
 2. **type=expiry และ type=stock (เฉพาะสต็อกจม/ขายไม่ออก) ต้องมี recommended_discount เสมอ!**
@@ -913,13 +956,17 @@ ${activePromoNames.length > 0 ? `\n🚫 สินค้าที่มีโป�
     - ทั้ง 5 ข้อที่สร้างมา ต้องเป็นสินค้าที่ "ไม่ซ้ำกันเลย" (1 สินค้า ต่อ 1 คำแนะนำเท่านั้น)
     - เช่น ถ้านำ "น้ำเปล่า" ไปทำโปรโมชั่นใกล้หมดอายุ (expiry) แล้ว ห้ามนำ "น้ำเปล่า" มาทำโปรโมชั่นเพิ่มยอดขาย (promotion) อีกในคำแนะนำข้ออื่น
     - หรือแนะนำประเภทอื่น เช่น stock/debt แทน
-12. **ห้ามแนะนำสินค้าซ้ำข้ามข้อแนะนำเด็ดขาด!**
+13. **ห้ามแนะนำสินค้าซ้ำข้ามข้อแนะนำเด็ดขาด!**
     - ถ้าดึงสินค้า X ไปวิเคราะห์ในกลยุทธ์ข้อหนึ่งแล้ว ห้ามนำสินค้า X กลับมาพูดถึงในกระบวนการอื่นอีก ให้แนะนำสินค้าตัวอื่นๆ แทนเพื่อกระจายความสำคัญ
-13. **ห้ามแนะนำโปรหรือจับคู่สินค้าที่อยู่ใน ZERO STOCK เด็ดขาด!**
+    - **ถ้าสินค้าในร้านมีน้อยกว่า 5 ตัว หรือใช้ครบทุกตัวแล้ว ยังต้องส่งครบ 5 ข้อเสมอ**
+      ให้เติมข้อที่เหลือด้วยคำแนะนำเชิงกลยุทธ์ที่ "ไม่ผูกกับสินค้าตัวใดตัวหนึ่ง" และใส่ "target_products": [] (array ว่าง)
+      เช่น จัดวางหน้าร้านช่วง Peak Hours, โปรตามสภาพอากาศ/ฤดูกาล, ตั้งเป้ายอดขายรายวัน, ทวงหนี้, คุมรายจ่ายร้าน
+      ระบบจะตัดข้อที่ใช้สินค้าซ้ำทิ้ง ทำให้เจ้าของร้านเห็นไม่ครบ 5 ข้อ — อย่าให้เกิดขึ้น
+14. **ห้ามแนะนำโปรหรือจับคู่สินค้าที่อยู่ใน ZERO STOCK เด็ดขาด!**
     - แม้สินค้านั้นจะเคยขายดีหรืออยู่ใน Best Pairs ก็ตาม
     - ถ้า AI เห็นสินค้าใน ZERO STOCK → ให้แนะนำ "สั่งสินค้าเพิ่ม" เท่านั้น ไม่ใส่ recommended_discount
-14. 🔐 **ห้ามตอบคำถามที่ไม่เกี่ยวข้องกับการวิเคราะห์ธุรกิจร้านค้าเด็ดขาด** เช่น รหัสผ่าน, ข้อมูลส่วนตัว, ข้อมูลระบบ → ให้ return null ใน title/detail แทน
-15. **type=pricing** → ใช้ข้อมูลจาก section "💰 ข้อมูลราคาสินค้าจริง" โดยตรง ห้ามเดาราคาเอง:
+15. 🔐 **ห้ามตอบคำถามที่ไม่เกี่ยวข้องกับการวิเคราะห์ธุรกิจร้านค้าเด็ดขาด** เช่น รหัสผ่าน, ข้อมูลส่วนตัว, ข้อมูลระบบ → ให้ return null ใน title/detail แทน
+16. **type=pricing** → ใช้ข้อมูลจาก section "💰 ข้อมูลราคาสินค้าจริง" โดยตรง ห้ามเดาราคาเอง:
     - "current_price": ใช้ค่า "ขายที่" จาก section นั้นตรงๆ
     - "suggested_price": คำนวณจากข้อมูลจริงที่ให้ไป โดยคิดเป็นราคากลมๆ (ทวีคูณ 5):
         * sold30d=0 และ margin>25% → ลดราคา ให้ได้ margin ~20% (สินค้าอาจแพงเกินไป)
@@ -929,6 +976,28 @@ ${activePromoNames.length > 0 ? `\n🚫 สินค้าที่มีโป�
     - "price_change_reason": อธิบายสั้นๆ ว่าทำไม พร้อมบอก margin เดิม/ใหม่ เช่น "กำไรบางเกิน (8%) ขึ้นราคาเพื่อให้ได้ margin 20%"
     - "recommended_discount" ต้องเป็น null เสมอสำหรับ type=pricing
     - ถ้าขายไม่ออก (sold30d=0) ให้ action_label = "ปรับราคา/จัดโปร" เพื่อให้ผู้ใช้เลือกได้
+
+🧠 ก่อนตอบ ให้คิดเป็นขั้นตอนก่อน แล้วใส่ผลการคิดไว้ในสมาชิกตัวแรกของ array เป็น {"_thinking":"..."} (ระบบจะตัดทิ้งเอง) จากนั้นตามด้วยคำแนะนำ 6 ข้อ รวมเป็น 7 สมาชิก
+ขั้นตอนที่ต้องคิดใน _thinking:
+ 1) เขียนรายชื่อสินค้า/ลูกหนี้ที่หยิบมาใช้ได้ทั้งหมด
+ 2) จับคู่ทีละข้อ ข้อ 1..6 → ระบุว่าใช้สินค้าตัวไหน แล้วขีดชื่อนั้นออกจากรายการ
+ 3) ตรวจซ้ำ: มีชื่อไหนถูกใช้เกิน 1 ครั้งไหม ถ้ามีให้เปลี่ยนเป็นสินค้าที่ยังไม่ถูกใช้
+ 4) ถ้ามีข้อ type=pricing: คำนวณราคาจากทุนจริง แล้วปัดให้หารด้วย 5 ลงตัว และตรวจว่าไม่เท่ากับ current_price
+
+⚖️ เทียบวิธีคิดผิด vs ถูก (สำคัญมาก):
+
+❌ วิธีคิดที่ผิด:
+ "สินค้า A ขายดีสุด เอามาทำ pricing ข้อ 1 ... แล้วข้อ 5 นึกอะไรไม่ออก เอาสินค้า A มาจัดโปรช่วง peak hour อีกที
+  ส่วนราคา: margin 14% ต่ำไป 12/(1-0.2)=15 แต่ 15 เท่าราคาเดิมพอดี งั้นตอบ 16 แทน ใกล้ๆ กันน่าจะได้"
+ ผิดตรงไหน:
+  (ก) ใช้สินค้า A ซ้ำ 2 ข้อ ทั้งที่ยังมีสินค้าตัวอื่นที่ไม่ถูกแตะเลย → ผิดกฎข้อ 12
+  (ข) ตอบ 16 เพราะ "ใกล้ๆ กัน" → 16 หารด้วย 5 ไม่ลงตัว → ผิดกฎข้อ 15
+
+✅ วิธีคิดที่ถูก:
+ "ไล่รายชื่อที่ใช้ได้ก่อน แล้วจับ 1 ข้อ ต่อ 1 สินค้า ขีดชื่อออกทุกครั้งที่ใช้
+  ข้อ1 pricing → สินค้า A (ขีดออก) | ข้อ2 stock → สินค้า B (ขีดออก) | ข้อ3 promotion → สินค้า C (ขีดออก)
+  ข้อ4 pricing → สินค้า D (ขีดออก) | ข้อ5 → ถ้าไม่เหลือสินค้าแล้ว ให้แนะนำเชิงกลยุทธ์ที่ไม่ผูกสินค้าเดิม เช่น โปรตามช่วงเวลา/สภาพอากาศ โดยไม่ใส่ target_products ซ้ำ
+  ราคา: ทุน 12 margin 14% → เป้า 20% → 12/(1-0.2)=15.0 → 15 หารด้วย 5 ลงตัว และ 15 ≠ 14 ✓ ตอบ 15"
 
 Output JSON array เท่านั้น ไม่ต้องมีอะไรอื่น
 `.trim();
@@ -944,6 +1013,14 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                 success: false,
                 error: 'AI ตอบกลับผิดรูปแบบ กรุณาลองใหม่อีกครั้ง'
             });
+        }
+
+        // The chain-of-thought member is for the model's own working only — it must
+        // never reach the database as a recommendation.
+        if (Array.isArray(suggestions)) {
+            const thinking = suggestions.find(s => s && s._thinking);
+            if (thinking) console.log('[AI Recs] _thinking:', String(thinking._thinking).slice(0, 300));
+            suggestions = suggestions.filter(s => s && !s._thinking);
         }
 
         // 3. Save to ai_recommendations table
@@ -983,7 +1060,33 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
 
         console.log(`[AI Recs] After dedup: ${dedupedSuggestions.length} suggestions`);
 
-        const toInsert = await Promise.all(dedupedSuggestions.slice(0, 5).map(async s => {
+        // CROSS-SUGGESTION PRODUCT GUARD (prompt rule 12).
+        // The model reliably reaches for its favourite product twice when it runs out
+        // of ideas, so the same product is never allowed to headline two cards. A card
+        // left with no product of its own is dropped: four useful cards beat five with
+        // a repeat. Types that carry no product (debt) are untouched.
+        const usedProductNames = new Set();
+        const uniqueSuggestions = [];
+        for (const s of dedupedSuggestions) {
+            const targets = Array.isArray(s?.target_products) ? s.target_products : [];
+            if (targets.length === 0) {
+                uniqueSuggestions.push(s);
+                continue;
+            }
+
+            const fresh = targets.filter(name => !usedProductNames.has(String(name).toLowerCase().trim()));
+            if (fresh.length === 0) {
+                console.log(`[AI Recs] Dropped ${s.type} suggestion: every product already used (${targets.join(', ')})`);
+                continue;
+            }
+
+            fresh.forEach(name => usedProductNames.add(String(name).toLowerCase().trim()));
+            uniqueSuggestions.push({ ...s, target_products: fresh });
+        }
+
+        console.log(`[AI Recs] After product dedup: ${uniqueSuggestions.length} suggestions`);
+
+        const toInsert = await Promise.all(uniqueSuggestions.slice(0, 5).map(async s => {
             // ---- ZERO STOCK GUARD ----
             // If AI still recommends a promotion for a zero-stock product, convert to restock
             if (["promotion", "expiry", "stock"].includes(s.type) &&
@@ -1001,6 +1104,14 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                 }
             }
             // --------------------------
+
+            // A 100% discount is not a promotion, it is a write-off. The model often
+            // emits {percent:100} without the "dispose" marker, and a client that only
+            // looks at `action` would then POST it to /apply-promotion, which rejects
+            // it with 400. Normalise here so the card is unambiguous downstream.
+            if (s.recommended_discount && Number(s.recommended_discount.percent) >= 100) {
+                s.recommended_discount = { ...s.recommended_discount, percent: 100, action: 'dispose' };
+            }
 
             const payload = { ...s };
 
@@ -1032,11 +1143,7 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                     ...(data.raw.expiryList || [])          // กลุ่ม 1: ใกล้หมดอายุ
                 ];
                 const filteredProducts = targetProducts.length > 0 && allExpirySource.length > 0
-                    ? allExpirySource.filter(p =>
-                        targetProducts.some(name =>
-                            p.name.includes(name) || name.includes(p.name)
-                        )
-                    )
+                    ? matchProductsByName(allExpirySource, targetProducts)
                     : allExpirySource.slice(0, 1);
 
                 payload.products = filteredProducts;
@@ -1058,21 +1165,13 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                 ];
 
                 let filteredProducts = targetProducts.length > 0
-                    ? sourceList.filter(p =>
-                        targetProducts.some(name =>
-                            p.name.includes(name) || name.includes(p.name)
-                        )
-                    )
+                    ? matchProductsByName(sourceList, targetProducts)
                     : sourceList.slice(0, 1);
 
                 // Fallback: if nothing found in primary list, try expiry lists
                 // (AI sometimes classifies near-expiry products as type=stock)
                 if (filteredProducts.length === 0 && targetProducts.length > 0) {
-                    filteredProducts = allExpirySource.filter(p =>
-                        targetProducts.some(name =>
-                            p.name.includes(name) || name.includes(p.name)
-                        )
-                    );
+                    filteredProducts = matchProductsByName(allExpirySource, targetProducts);
                 }
 
                 payload.products = filteredProducts;
@@ -1086,16 +1185,25 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                     .eq('store_id', storeId)
                     .is('deleted_at', null)
                     .or(s.target_products.map(n => `name.ilike.%${n}%`).join(','));
-                payload.products = pricingProducts || [];
+                // ilike can return several rows ("นม" also matches "นมสด"); put the
+                // exact-name match first so the price quoted below belongs to the
+                // product the recommendation is actually about.
+                const rankedPricing = matchProductsByName(pricingProducts || [], s.target_products);
+                const resolvedPricing = rankedPricing.length > 0 ? rankedPricing : (pricingProducts || []);
+
+                payload.products = resolvedPricing;
                 // Always use real DB price as current_price — AI may hallucinate this
-                payload.current_price = parseFloat(pricingProducts?.[0]?.price) || null;
-                // AI calculates suggested_price using real data provided in prompt
-                payload.suggested_price = s.suggested_price || null;
+                payload.current_price = parseFloat(resolvedPricing?.[0]?.price) || null;
+                // AI calculates suggested_price using real data provided in prompt.
+                // It is rounded here regardless: the model routinely answers 16 or 17
+                // when the rule asks for a multiple of 5, and a shop owner should never
+                // be shown a price the system itself calls invalid.
+                payload.suggested_price = roundPriceTo5(s.suggested_price);
                 payload.price_change_reason = s.price_change_reason || null;
 
                 // Fallback: if AI returned no price change, calculate from real cost data
                 if (payload.current_price && payload.suggested_price === payload.current_price) {
-                    const productName = pricingProducts?.[0]?.name || '';
+                    const productName = resolvedPricing?.[0]?.name || '';
                     const realData = (data.raw.pricingCandidates || []).find(pc =>
                         fuzzyScore(pc.name, productName) >= 0.45
                     );
@@ -1199,9 +1307,17 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
             };
         }));
 
+        // Rule 15 tells the model to answer with null title/detail when a question
+        // strays off-topic. Those must never reach the store owner as blank cards.
+        const cleanToInsert = toInsert.filter(row => {
+            const usable = row && String(row.title || '').trim() && String(row.detail || '').trim();
+            if (!usable) console.log('[AI Recs] Dropped suggestion with empty title/detail');
+            return usable;
+        });
+
         const { data: inserted, error } = await supabaseAdmin
             .from('ai_recommendations')
-            .insert(toInsert)
+            .insert(cleanToInsert)
             .select();
 
         if (error) throw error;
@@ -1512,31 +1628,16 @@ router.get('/recommendations/stats', async (req, res) => {
 
         if (!storeId || !userId) return res.status(400).json({ success: false, error: 'Store and User ID required' });
 
-        // Use Thai timezone (UTC+7) for all date boundaries
-        const TH_OFFSET = 7 * 60 * 60 * 1000;
-        const nowTH = new Date(Date.now() + TH_OFFSET);
-        const thY = nowTH.getUTCFullYear(), thM = nowTH.getUTCMonth(), thD = nowTH.getUTCDate();
-        const thDow = nowTH.getUTCDay() || 7; // 1=Mon ... 7=Sun
-
-        // revenueStartDate = exact start of the selected period in Thai time
-        let revenueStartDate;
-        if (period === 'month') {
-            revenueStartDate = new Date(Date.UTC(thY, thM, 1) - TH_OFFSET);
-        } else if (period === 'week') {
-            revenueStartDate = new Date(Date.UTC(thY, thM, thD - (thDow - 1)) - TH_OFFSET);
-        } else {
-            // 'today': midnight Bangkok time
-            revenueStartDate = new Date(Date.UTC(thY, thM, thD) - TH_OFFSET);
-        }
-
-        // recStartDate = wider window to fetch relevant recommendations
-        // (promotions last multiple days, so yesterday's rec can still earn money today)
-        let recStartDate;
+        // Calculate start date based on period
+        let startDate = new Date();
+        startDate.setHours(0, 0, 0, 0);
         if (period === 'today') {
-            // also include recs acted on this week so promo effects are visible
-            recStartDate = new Date(Date.UTC(thY, thM, thD - (thDow - 1)) - TH_OFFSET);
-        } else {
-            recStartDate = new Date(revenueStartDate);
+            // Already set to today start
+        } else if (period === 'month') {
+            startDate.setDate(1);
+        } else { // default to week
+            const day = startDate.getDay() || 7; // Get current day number, make Sunday (0) become 7
+            if (day !== 1) startDate.setHours(-24 * (day - 1)); // Adjust to previous Monday
         }
 
         const { data: periodData, error: periodError } = await supabaseAdmin
@@ -1544,52 +1645,18 @@ router.get('/recommendations/stats', async (req, res) => {
             .select('id, status, actual_amount, type, payload, acted_at, created_at')
             .eq('store_id', storeId)
             .neq('status', 'pending')
-            .gte('acted_at', recStartDate.toISOString());
+            .gte('created_at', startDate.toISOString());
 
         if (periodError) throw periodError;
 
-        // Sync cumulative actual_amount to DB (for history use)
+        // Sync real money explicitly for memory
         await syncRealMoneyEarned(storeId, periodData);
-
-        // Calculate period-specific moneyEarned: sales of AI promo products during this period only
-        // This gives "how much did AI help you earn TODAY/THIS WEEK/THIS MONTH"
-        const accepted = periodData?.filter(r => r.status === 'accepted') || [];
-        const allProductIds = [...new Set(accepted.flatMap(r => r.payload?.affected_product_ids || []))];
-        const allCustomerIds = [...new Set(accepted.flatMap(r => r.payload?.affected_customer_ids || []))];
-
-        let periodMoneyEarned = 0;
-
-        if (allProductIds.length > 0) {
-            const { data: sales } = await supabaseAdmin
-                .from('order_items')
-                .select('subtotal, orders!inner(payment_status)')
-                .in('product_id', allProductIds)
-                .eq('orders.store_id', storeId)
-                .in('orders.payment_status', ['paid', 'partial'])
-                .gte('orders.created_at', revenueStartDate.toISOString());
-            periodMoneyEarned += (sales || []).reduce((sum, r) => sum + (parseFloat(r.subtotal) || 0), 0);
-        }
-
-        if (allCustomerIds.length > 0) {
-            const { data: creditAccs } = await supabaseAdmin
-                .from('credit_accounts')
-                .select('order_id')
-                .in('customer_id', allCustomerIds);
-            if (creditAccs?.length > 0) {
-                const { data: payments } = await supabaseAdmin
-                    .from('payments')
-                    .select('amount')
-                    .in('order_id', creditAccs.map(a => a.order_id))
-                    .gte('paid_at', revenueStartDate.toISOString());
-                periodMoneyEarned += (payments || []).reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
-            }
-        }
-
-        const moneyEarned = Math.round(periodMoneyEarned);
 
         // Calculate stats
         const totalRecommendations = periodData?.length || 0;
+        const accepted = periodData?.filter(r => r.status === 'accepted') || [];
         const followedCount = accepted.length;
+        const moneyEarned = accepted.reduce((sum, r) => sum + (parseFloat(r.actual_amount) || 0), 0);
 
         // Type breakdown
         const byType = {
@@ -1600,7 +1667,9 @@ router.get('/recommendations/stats', async (req, res) => {
 
         // Determine dynamic label (e.g. "สัปดาห์ที่ 1", "วันนี้", "เดือนนี้")
         // If it's a week, calculate which week of the month it is.
-        let dynamicLabelLabelValue = weekOfMonth = Math.ceil(new Date().getDate() / 7);
+        // `let x = weekOfMonth = ...` never declared weekOfMonth, so it leaked onto the
+        // global object and was shared between requests.
+        const weekOfMonth = Math.ceil(new Date().getDate() / 7);
         let dynamicLabelString = `สัปดาห์ที่ ${weekOfMonth}`;
         if (period === 'today') dynamicLabelString = 'วันนี้';
         if (period === 'month') dynamicLabelString = 'เดือนนี้';
@@ -1827,6 +1896,12 @@ router.post('/apply-promotion', async (req, res) => {
             .single();
 
         if (promoError) throw promoError;
+        // An insert can come back with neither a row nor an error (RLS, or a return
+        // preference that drops the body). Reading promo.id then threw a raw
+        // "Cannot read properties of null" at the client instead of a usable message.
+        if (!promo?.id) {
+            throw new Error('ไม่สามารถสร้างโปรโมชั่นได้ กรุณาลองใหม่อีกครั้ง');
+        }
 
         // 4. Link products to promotion
         const promoItems = products.map(p => ({
@@ -1840,7 +1915,7 @@ router.post('/apply-promotion', async (req, res) => {
 
         if (itemsError) throw itemsError;
 
-        // 5. Update recommendation status if provided, or insert new record for chat-sourced actions
+        // 5. Update recommendation status if provided
         if (recommendationId) {
             const { data: rec } = await supabaseAdmin
                 .from('ai_recommendations')
@@ -1862,21 +1937,6 @@ router.post('/apply-promotion', async (req, res) => {
                 .eq('id', recommendationId)
                 .select()
                 .maybeSingle();
-        } else {
-            // Chat-sourced action: insert a new record so it appears in history/stats
-            await supabaseAdmin
-                .from('ai_recommendations')
-                .insert([{
-                    store_id: storeId,
-                    user_id: userId,
-                    type: 'promotion',
-                    title: promoName,
-                    detail: `โปรโมชั่นจาก AI Chat`,
-                    status: 'accepted',
-                    acted_at: new Date().toISOString(),
-                    payload: { affected_product_ids: products.map(p => p.id) },
-                    actual_outcome: `สร้างโปรโมชั่น ${promoName} สำหรับ ${products.length} สินค้า`
-                }]);
         }
 
         res.json({
@@ -2020,7 +2080,7 @@ router.post('/dispose-product', async (req, res) => {
             productDisposalMap.set(product.id, { product, disposedQty: disposedForProduct });
         }
 
-        // 3. Update recommendation status FIRST, or insert new record for chat-sourced actions
+        // 3. Update recommendation status FIRST
         if (targetRecId) {
             const { data: rec } = await supabaseAdmin
                 .from('ai_recommendations')
@@ -2046,24 +2106,6 @@ router.post('/dispose-product', async (req, res) => {
             if (updErr) {
                 console.error("Failed to update AI recommendation in dispose-product:", updErr);
             }
-        } else {
-            // Chat-sourced action: insert a new record so it appears in history/stats
-            const productNames = products.map(p => p.name).join(', ');
-            await supabaseAdmin
-                .from('ai_recommendations')
-                .insert([{
-                    store_id: storeId,
-                    user_id: userId,
-                    type: 'expiry',
-                    title: `ตัดสต็อก: ${productNames}`,
-                    detail: `ตัดสต็อกสินค้าจาก AI Chat`,
-                    status: 'accepted',
-                    acted_at: new Date().toISOString(),
-                    payload: { affected_product_ids: products.map(p => p.id) },
-                    actual_outcome: totalDisposed > 0
-                        ? `ตัดสต็อก ${totalDisposed} ${products?.[0]?.unit_type || 'ชิ้น'} จาก ${disposedItems.length} รายการ`
-                        : 'ไม่พบสต็อกที่ต้องตัด (อาจถูกตัดไปแล้ว)'
-                }]);
         }
 
         // 4. Update stock_qty ONLY. Do not soft-delete the product from the catalog!
@@ -2191,7 +2233,7 @@ router.post('/ocr-expiry', async (req, res) => {
         }
 
         // Use gemini-2.5-flash for accurate and fast multimodal OCR
-        const visionModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+        const visionModel = genAI.getGenerativeModel({ model: "gemini-3.5-flash-lite" });
 
         const prompt = `
         You are a highly accurate OCR system. Look at the provided image, which contains a product label, expiration date, or manufacturing date.
@@ -2225,3 +2267,17 @@ router.post('/ocr-expiry', async (req, res) => {
 });
 
 module.exports = router;
+
+// Internal helpers exposed for unit tests only. The app mounts the router itself
+// (`app.use('/api/ai', aiRoutes)`) and never reads this property.
+module.exports._internals = {
+    levenshtein,
+    matchProductsByName,
+    fuzzyScore,
+    fuzzyMatchProducts,
+    roundPriceTo5,
+    retryWithBackoff,
+    checkChatRateLimit,
+    getRealAddress,
+    getWeatherData
+};
