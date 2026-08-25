@@ -27,6 +27,32 @@ const registerSalesRoutes = ({
                 return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
             }
 
+            // 0. Pre-flight stock check for the WHOLE cart, before anything is written.
+            // Creating the order first and bailing out mid-loop used to leave an orphan
+            // order row behind whenever a line item turned out to be short.
+            const stockCache = new Map(); // productId -> product row
+            for (const item of items) {
+                const productId = item.product_id || item.id;
+                const { data: product } = await supabaseAdmin
+                    .from('products')
+                    .select('stock_qty, low_stock_threshold, name, unit_type')
+                    .eq('id', productId)
+                    .single();
+
+                stockCache.set(productId, product);
+
+                const qtyToDeduct = (parseFloat(item.quantity) * getUnitMultiplier(item.unit_code))
+                    / getUnitMultiplier(product?.unit_type);
+                const currentStock = parseFloat(product?.stock_qty || 0);
+
+                if (qtyToDeduct > currentStock && currentStock >= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `สต็อกไม่เพียงพอ: ${product?.name} มีเหลือ ${currentStock} ${product?.unit_type || 'ชิ้น'}`
+                    });
+                }
+            }
+
             // 1. Create Order
             const orderNo = `ORD-${Date.now().toString().slice(-8)}`; // Simple Order No
 
@@ -59,24 +85,13 @@ const registerSalesRoutes = ({
                 const unitLabel = item.unit || item.unit_type || 'ชิ้น';
                 const productId = item.product_id || item.id;
                 const price = parseFloat(item.price);
-                // ดึงข้อมูลสินค้าก่อน (ต้องรู้ unit_type เพื่อแปลงหน่วย)
-                const { data: product } = await supabaseAdmin
-                    .from('products')
-                    .select('stock_qty, low_stock_threshold, name, unit_type')
-                    .eq('id', productId)
-                    .single();
+                // ข้อมูลสินค้าอ่านไปแล้วตอน pre-flight check ด้านบน
+                const product = stockCache.get(productId);
                 // แปลงจำนวนขาย → หน่วยของสินค้า
                 const saleMultiplier = getUnitMultiplier(unitCode);
                 const productMultiplier = getUnitMultiplier(product?.unit_type);
-                let qtyToDeduct = (parseFloat(item.quantity) * saleMultiplier) / productMultiplier;
-                // ห้ามขายเกิน stock
+                const qtyToDeduct = (parseFloat(item.quantity) * saleMultiplier) / productMultiplier;
                 const currentStock = parseFloat(product?.stock_qty || 0);
-                if (qtyToDeduct > currentStock && currentStock >= 0) {
-                    return res.status(400).json({
-                        success: false,
-                        error: `สต็อกไม่เพียงพอ: ${product?.name} มีเหลือ ${currentStock} ${product?.unit_type || 'ชิ้น'}`
-                    });
-                }
 
                 // 2.1 Get Product Batches (FIFO: Expiring First)
                 const { data: batches, error: batchFetchError } = await supabaseAdmin
@@ -294,10 +309,40 @@ const registerSalesRoutes = ({
             console.log('Received credit-sale request:', req.body);
             const { customer_name, customer_phone, due_date, amount, items, customer_id, is_new_customer, customer_image } = req.body;
             const storeId = req.headers['x-store-id'];
+            const userId = req.user.id;
 
             if (!storeId) {
                 console.error('Credit Sale Error: Missing store_id');
                 return res.status(400).json({ success: false, error: 'Store ID required' });
+            }
+
+            if (!await checkStoreAccess(storeId, userId)) {
+                return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
+            }
+
+            // Pre-flight stock check before any customer/order/credit row is written,
+            // so a short line item cannot leave half a sale behind.
+            const creditStockCache = new Map(); // productId -> product row
+            for (const item of items || []) {
+                const productId = item.product_id || item.id;
+                const { data: product } = await supabaseAdmin
+                    .from('products')
+                    .select('stock_qty, low_stock_threshold, name, unit_type')
+                    .eq('id', productId)
+                    .single();
+
+                creditStockCache.set(productId, product);
+
+                const qtyToDeduct = (parseFloat(item.quantity) * getUnitMultiplier(item.unit_code))
+                    / getUnitMultiplier(product?.unit_type);
+                const currentStock = parseFloat(product?.stock_qty || 0);
+
+                if (qtyToDeduct > currentStock && currentStock >= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `สต็อกไม่เพียงพอ: ${product?.name} มีเหลือ ${currentStock} ${product?.unit_type || 'ชิ้น'}`
+                    });
+                }
             }
 
             let customer;
@@ -454,22 +499,12 @@ const registerSalesRoutes = ({
                     const unitLabel = item.unit || item.unit_type || 'ชิ้น';
                     const productId = item.product_id || item.id;
                     const price = parseFloat(item.price);
-                    // ดึงข้อมูลสินค้า
-                    const { data: products } = await supabaseAdmin
-                        .from('products')
-                        .select('stock_qty, low_stock_threshold, name, unit_type')
-                        .eq('id', productId)
-                        .single();
+                    // ข้อมูลสินค้าอ่านไปแล้วตอน pre-flight check ด้านบน
+                    const products = creditStockCache.get(productId);
                     const saleMultiplier = getUnitMultiplier(unitCode);
                     const productMultiplier = getUnitMultiplier(products?.unit_type);
-                    let qtyToDeduct = (parseFloat(item.quantity) * saleMultiplier) / productMultiplier;
+                    const qtyToDeduct = (parseFloat(item.quantity) * saleMultiplier) / productMultiplier;
                     const currentStocks = parseFloat(products?.stock_qty || 0);
-                    if (qtyToDeduct > currentStocks && currentStocks >= 0) {
-                        return res.status(400).json({
-                            success: false,
-                            error: `สต็อกไม่เพียงพอ: ${products?.name} มีเหลือ ${currentStocks} ${products?.unit_type || 'ชิ้น'}`
-                        });
-                    }
 
                     // Get Product Batches (FIFO)
                     const { data: batches } = await supabaseAdmin

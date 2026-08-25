@@ -8,9 +8,12 @@ const convertDateFormat = (dateInput) => {
         if (typeof dateInput === 'string' && dateInput.includes('/')) {
             const parts = dateInput.split('/');
             if (parts.length === 3) {
-                const day = parseInt(parts[0], 10);
+                // A 4-digit leading part means YYYY/MM/DD, not DD/MM/YYYY. Without this
+                // check "2025/06/15" was read as day=2025 and landed 105 years off.
+                const isYearFirst = /^\d{4}$/.test(parts[0].trim());
+                const day = parseInt(isYearFirst ? parts[2] : parts[0], 10);
                 const month = parseInt(parts[1], 10) - 1; // Month is 0-indexed
-                const year = parseInt(parts[2], 10);
+                const year = parseInt(isYearFirst ? parts[0] : parts[2], 10);
                 d = new Date(year, month, day);
             } else {
                 d = new Date(dateInput);

@@ -127,6 +127,8 @@ const registerNotificationRoutes = ({
             const today = new Date(Date.UTC(thY, thM, thD) - TH_OFFSET);
             const startOfDay = today;
 
+            let created = 0;
+
             // 4. Check each customer status
             for (const customerId in customerDebts) {
                 const data = customerDebts[customerId];
@@ -516,8 +518,11 @@ const registerNotificationRoutes = ({
         // Run immediately on start
         runChecks();
 
-        // Then run every 24 hours (86400000 ms) - Daily Safety Net
-        setInterval(runChecks, 86400000);
+        // Then run every 24 hours (86400000 ms) - Daily Safety Net.
+        // unref() so this timer alone never keeps the process alive; the HTTP server
+        // is what should decide the lifetime.
+        const timer = setInterval(runChecks, 86400000);
+        if (typeof timer.unref === 'function') timer.unref();
     };
 
     // Start the scheduler

@@ -16,6 +16,13 @@ app.get('/api/stores/settings', async (req, res) => {
         // Check Access & Role
         let role = 'member';
         const { data: store } = await supabaseAdmin.from('stores').select('*').eq('id', storeId).single();
+
+        if (!store) {
+            // Without this the handler dereferenced a null store further down and
+            // answered 500 instead of telling the caller the store is gone.
+            return res.status(404).json({ success: false, error: 'Store not found' });
+        }
+
         if (store && store.owner_id === userId) {
             role = 'owner';
         } else {
