@@ -4,3 +4,10 @@ node_modules/
 .env*.local
 *.log
 .DS_Store
+
+# Test + evaluation artifacts
+coverage/
+tests/ai-eval/last-run.json
+tests/ai-eval/last-prompt-ab.json
+tests/ai-eval/last-ocr-run.json
+tests/ai-eval/captured-prompts.json
