@@ -1,5 +1,51 @@
 const { encrypt, decrypt } = require('../../utils/crypto');
 
+describe('utils/crypto key validation', () => {
+    const original = process.env.ENCRYPTION_KEY;
+
+    afterEach(() => {
+        process.env.ENCRYPTION_KEY = original;
+        jest.resetModules();
+    });
+
+    /** Load the module fresh with a specific key. */
+    function loadWith(key) {
+        jest.resetModules();
+        if (key === undefined) delete process.env.ENCRYPTION_KEY;
+        else process.env.ENCRYPTION_KEY = key;
+        return () => require('../../utils/crypto');
+    }
+
+    it('refuses to load when the key is missing, naming the variable', () => {
+        expect(loadWith(undefined)).toThrow(/ENCRYPTION_KEY is not set/);
+    });
+
+    it('refuses to load when the key is the wrong length, reporting the actual size', () => {
+        expect(loadWith('too-short')).toThrow(/must be exactly 32 bytes/);
+        expect(loadWith('too-short')).toThrow(/is 9 bytes/);
+    });
+
+    it('rejects the 43-byte placeholder that used to be the silent default', () => {
+        expect(loadWith('default_secret_key_must_be_32_bytes_long_!!')).toThrow(/43 bytes/);
+    });
+
+    it('tells the operator how to generate a valid key', () => {
+        expect(loadWith(undefined)).toThrow(/randomBytes\(24\)/);
+    });
+
+    it('counts bytes, not characters, so multi-byte keys are rejected', () => {
+        // 32 Thai characters are 96 bytes in UTF-8.
+        expect(loadWith('ก'.repeat(32))).toThrow(/is 96 bytes/);
+    });
+
+    it('loads with a valid 32-byte key', () => {
+        const load = loadWith('abcdefghijklmnopqrstuvwxyz123456');
+        expect(load).not.toThrow();
+        const { encrypt: enc, decrypt: dec } = load();
+        expect(dec(enc('hello'))).toBe('hello');
+    });
+});
+
 describe('utils/crypto', () => {
     describe('encrypt()', () => {
         it('returns null for falsy input', () => {
