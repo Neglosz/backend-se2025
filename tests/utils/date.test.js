@@ -61,4 +61,22 @@ describe('utils/date convertDateFormat()', () => {
             if (out !== null) expect(out).toMatch(/^\d{4,}-\d{2}-\d{2}$/);
         }
     });
+
+    describe('inputs that are not dates at all', () => {
+        it('returns null instead of throwing when the value cannot be inspected', () => {
+            const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            // A value whose `includes` throws — the guard must swallow it, because a
+            // malformed due date must never take down the request that carried it.
+            const hostile = {
+                toString: () => { throw new Error('nope'); },
+                get length() { throw new Error('nope'); }
+            };
+
+            expect(convertDateFormat(hostile)).toBeNull();
+            expect(spy).toHaveBeenCalledWith('Date conversion error', expect.any(Error));
+
+            spy.mockRestore();
+        });
+    });
+
 });

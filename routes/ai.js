@@ -532,10 +532,11 @@ const getStoreSummary = async (storeId, lat, lon) => {
         `• ⚠️ ${e.name}: ${e.qty} ${e.unit} (${e.status}) | ทุน ฿${e.costPrice} ราคาขาย ฿${e.sellPrice}`
     ).join('\n') || 'ไม่มีสินค้าใกล้หมดอายุ';
 
-    // Format Date Range
-    const startOfMonthDate = new Date(startOfMonth);
+    // Format Date Range. startOfMonth is a UTC instant seven hours behind Bangkok
+    // midnight, so reading a day number off it lands on the last day of the previous
+    // month ("31 - 26 ส.ค."). The Bangkok month always starts on the 1st.
     const daysCount = nowTH.getUTCDate();
-    const dateRangeStr = `${startOfMonthDate.getUTCDate()} - ${daysCount} ${nowTH.toLocaleString('th-TH', { month: 'short', timeZone: 'Asia/Bangkok' })} (${daysCount} Days)`;
+    const dateRangeStr = `1 - ${daysCount} ${nowTH.toLocaleString('th-TH', { month: 'short', timeZone: 'Asia/Bangkok' })} (${daysCount} Days)`;
     const netProfitMonth = profitMonth - totalExpenses; // กำไรสุทธิจริงๆ!
 
     const contextText = `
