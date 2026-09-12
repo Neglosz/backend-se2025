@@ -13,6 +13,15 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
             if (!storeId) return res.status(400).json({ success: false, error: 'Store ID required' });
             if (!await checkStoreAccess(storeId, userId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
 
+            // Filtering on the payment method needs an inner join so the parent order
+            // rows are filtered too; every other case uses the plain embed. Pick the
+            // select once, then apply ALL filters to the single query object — the
+            // previous version rebuilt the query inside the cash/qr branches and
+            // silently dropped any status filter applied before it.
+            const PAYMENT_METHOD_COLUMN = { cash: 'cash', qr: 'qr_promptpay' };
+            const needsInnerJoin = Object.prototype.hasOwnProperty.call(PAYMENT_METHOD_COLUMN, paymentMethod || '');
+            const paymentsEmbed = needsInnerJoin ? 'payments!inner(method)' : 'payments(method)';
+
             let query = supabaseAdmin
                 .from('orders')
                 .select(`
@@ -23,7 +32,7 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
                 payment_status,
                 payment_type,
                 customers_info(name),
-                payments(method)
+                ${paymentsEmbed}
             `, { count: 'exact' })
                 .eq('store_id', storeId);
 
@@ -50,51 +59,10 @@ const registerOrderRoutes = ({ app, supabaseAdmin, checkStoreAccess }) => {
             }
 
             // 3. Payment Method (Cash, QR, Credit)
-            if (paymentMethod) {
-                if (paymentMethod === 'credit') {
-                    query = query.eq('payment_type', 'credit_sale');
-                } else if (paymentMethod === 'cash') {
-                    // Filter where associated payment is cash
-                    // Note: This requires !inner join behavior to filter parent rows
-                    // Re-define select to use inner join for filtering
-                    query = supabaseAdmin
-                        .from('orders')
-                        .select(`
-                        id,
-                        order_no,
-                        total_amount,
-                        created_at,
-                        payment_status,
-                        payment_type,
-                        customers_info(name),
-                        payments!inner(method)
-                    `, { count: 'exact' })
-                        .eq('store_id', storeId)
-                        .eq('payments.method', 'cash');
-
-                    // Re-apply date filters if needed (duplication, but necessary if query object reset)
-                    if (startDate) query = query.gte('created_at', startDate);
-                    if (endDate) query = query.lte('created_at', endDate);
-
-                } else if (paymentMethod === 'qr') {
-                    query = supabaseAdmin
-                        .from('orders')
-                        .select(`
-                        id,
-                        order_no,
-                        total_amount,
-                        created_at,
-                        payment_status,
-                        payment_type,
-                        customers_info(name),
-                        payments!inner(method)
-                    `, { count: 'exact' })
-                        .eq('store_id', storeId)
-                        .eq('payments.method', 'qr_promptpay');
-
-                    if (startDate) query = query.gte('created_at', startDate);
-                    if (endDate) query = query.lte('created_at', endDate);
-                }
+            if (paymentMethod === 'credit') {
+                query = query.eq('payment_type', 'credit_sale');
+            } else if (needsInnerJoin) {
+                query = query.eq('payments.method', PAYMENT_METHOD_COLUMN[paymentMethod]);
             }
 
             // 3. Sorting

@@ -7,7 +7,13 @@
         "start": "node server.js",
         "dev": "node server.js",
         "test-db": "node test-connection.js",
-        "test-notify": "node test-notification.js"
+        "test-notify": "node test-notification.js",
+        "test": "jest",
+        "test:watch": "jest --watch",
+        "test:coverage": "jest --coverage",
+        "eval:ai": "jest --testMatch=\"**/tests/ai-eval/*.eval.js\" --runInBand --testTimeout=180000",
+        "eval:prompt": "jest --testMatch=\"**/tests/ai-eval/promptTechniques.eval.js\" --runInBand --testTimeout=300000",
+        "eval:ocr": "jest --testMatch=\"**/tests/ai-eval/ocrExpiry.eval.js\" --runInBand --testTimeout=300000"
     },
     "keywords": [
         "pos",
@@ -27,5 +33,9 @@
         "helmet": "^7.2.0",
         "multer": "^2.0.2",
         "promptpay-qr": "^0.5.0"
+    },
+    "devDependencies": {
+        "jest": "^30.4.2",
+        "supertest": "^7.2.2"
     }
 }

@@ -243,7 +243,7 @@ const registerProductRoutes = ({
             const userId = req.user.id;
             if (!storeId) return res.status(400).json({ success: false, error: 'Missing store ID' });
 
-            const hasAccess = await checkStoreAccess(userId, storeId);
+            const hasAccess = await checkStoreAccess(storeId, userId);
             if (!hasAccess) return res.status(403).json({ success: false, error: 'Unauthorized' });
 
             const { data, error } = await supabaseAdmin
@@ -265,13 +265,36 @@ const registerProductRoutes = ({
         try {
             const { id } = req.params;
             const { quantity, costPrice, salePrice, expireDate } = req.body;
-            const storeId = req.headers['x-store-id']; // Needed for notification cleanup
+            const storeId = req.headers['x-store-id'];
+            const userId = req.user.id;
             const qty = parseFloat(quantity) || 0;
             const cost = parseFloat(costPrice) || 0;
             const sale = parseFloat(salePrice) || 0;
 
             if (qty <= 0) {
                 return res.status(400).json({ success: false, error: 'กรุณากรอกจำนวนสินค้า' });
+            }
+
+            if (!storeId) {
+                return res.status(400).json({ success: false, error: 'Store ID required' });
+            }
+
+            if (!await checkStoreAccess(storeId, userId)) {
+                return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
+            }
+
+            // The product id comes straight from the URL, so confirm it belongs to this
+            // store before writing anything against it.
+            const { data: owned } = await supabaseAdmin
+                .from('products')
+                .select('id')
+                .eq('id', id)
+                .eq('store_id', storeId)
+                .is('deleted_at', null)
+                .maybeSingle();
+
+            if (!owned) {
+                return res.status(404).json({ success: false, error: 'ไม่พบสินค้าในร้านนี้' });
             }
 
             // 1. Create new batch
@@ -315,7 +338,8 @@ const registerProductRoutes = ({
             await supabaseAdmin
                 .from('products')
                 .update(updateData)
-                .eq('id', id);
+                .eq('id', id)
+                .eq('store_id', storeId);
 
             // AUTO-RESOLVE: Stock added -> Clear "Stock Out" and "Low Stock" alerts
             // If stock is now healthy (or user just wants to clear alerts by restocking)
@@ -439,12 +463,22 @@ const registerProductRoutes = ({
         try {
             const { id } = req.params;
             const storeId = req.headers['x-store-id'];
+            const userId = req.user.id;
+
+            if (!storeId) {
+                return res.status(400).json({ success: false, error: 'Store ID required' });
+            }
+
+            if (!await checkStoreAccess(storeId, userId)) {
+                return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
+            }
 
             // Check if category is used by any products
             const { data: products } = await supabaseAdmin
                 .from('products')
                 .select('id')
                 .eq('category_id', id)
+                .eq('store_id', storeId)
                 .is('deleted_at', null)
                 .limit(1);
 
@@ -456,16 +490,11 @@ const registerProductRoutes = ({
             }
 
             // Delete with store_id check for security
-            let query = supabaseAdmin
+            const { error } = await supabaseAdmin
                 .from('product_categories')
                 .delete()
-                .eq('id', id);
-
-            if (storeId) {
-                query = query.eq('store_id', storeId);
-            }
-
-            const { error } = await query;
+                .eq('id', id)
+                .eq('store_id', storeId);
 
             if (error) throw error;
             res.json({ success: true, message: 'Category deleted successfully' });
@@ -480,9 +509,21 @@ const registerProductRoutes = ({
             const { id } = req.params;
             const { newPrice } = req.body;
             const storeId = req.headers['x-store-id'];
+            const userId = req.user.id;
 
-            if (!newPrice || isNaN(newPrice) || parseFloat(newPrice) < 0) {
+            // `!newPrice` would reject a legitimate price of 0, so test for "absent"
+            // explicitly and let the `< 0` guard below do the range check.
+            const priceMissing = newPrice === undefined || newPrice === null || newPrice === '';
+            if (priceMissing || isNaN(newPrice) || parseFloat(newPrice) < 0) {
                 return res.status(400).json({ success: false, error: 'ราคาไม่ถูกต้อง' });
+            }
+
+            if (!storeId) {
+                return res.status(400).json({ success: false, error: 'Store ID required' });
+            }
+
+            if (!await checkStoreAccess(storeId, userId)) {
+                return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
             }
 
             const { data, error } = await supabaseAdmin
@@ -509,10 +550,19 @@ const registerProductRoutes = ({
             // Now receives JSON body instead of multipart/form-data
             const { code, name, categoryId, quantity, costPrice, salePrice, lowStockThreshold, unitType, expireDate, imageUrl, isWeightable } = req.body;
             const storeId = req.headers['x-store-id'];
+            const userId = req.user.id;
 
             // Validate required fields
             if (!name || !name.trim()) {
                 return res.status(400).json({ success: false, error: 'กรุณากรอกชื่อสินค้า' });
+            }
+
+            if (!storeId) {
+                return res.status(400).json({ success: false, error: 'Store ID required' });
+            }
+
+            if (!await checkStoreAccess(storeId, userId)) {
+                return res.status(403).json({ success: false, error: 'Unauthorized access to store' });
             }
 
             // 1. Insert Product
@@ -527,7 +577,6 @@ const registerProductRoutes = ({
                     price: parseFloat(salePrice) || 0,
                     low_stock_threshold: parseFloat(lowStockThreshold) || 0,
                     unit_type: unitType || 'ชิ้น',
-                    store_id: storeId,
                     store_id: storeId,
                     image_url: await (async () => {
                         if (imageUrl && imageUrl.startsWith('data:image')) {

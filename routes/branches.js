@@ -7,6 +7,8 @@ const supabaseAdmin = createClient(
     process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+const { encrypt, decrypt } = require('../utils/crypto');
+
 const multer = require('multer');
 
 const storage = multer.memoryStorage();
@@ -79,7 +81,37 @@ router.post('/create-manager', async (req, res) => {
                 role: 'manager',
             });
 
-        if (memberError) throw memberError;
+        if (memberError) {
+            // Roll back the auth account we just created, otherwise a failed link leaves
+            // an orphan user that blocks the email from being reused.
+            try {
+                await supabaseAdmin.auth.admin.deleteUser(userId);
+            } catch (cleanupError) {
+                console.error('Failed to roll back orphan manager account:', userId, cleanupError.message);
+            }
+            throw memberError;
+        }
+
+        // Store the credentials here rather than letting the client write them, so the
+        // password is only ever encrypted with the server-side key.
+        await supabaseAdmin
+            .from('store_credentials')
+            .delete()
+            .eq('store_id', store_id);
+
+        const { error: credError } = await supabaseAdmin
+            .from('store_credentials')
+            .insert({
+                store_id,
+                email,
+                password_encrypted: encrypt(password),
+            });
+
+        if (credError) {
+            // The manager account itself is usable; only the owner's "view password"
+            // convenience is lost, so this must not fail the request.
+            console.error('Failed to store manager credentials:', credError);
+        }
 
         res.json({
             success: true,
@@ -115,6 +147,14 @@ router.post('/reset-credentials', async (req, res) => {
             return res.status(403).json({ error: 'Not authorized' });
         }
 
+        // Validate email format BEFORE removing the current manager. Doing it the other
+        // way round left the store with no manager at all whenever the new address was
+        // malformed, because the 400 fired after the old account was already deleted.
+        const emailRegex = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+        if (!emailRegex.test(new_email)) {
+            return res.status(400).json({ error: 'Invalid email format' });
+        }
+
         // Delete old user if provided
         if (old_user_id) {
             await supabaseAdmin.auth.admin.deleteUser(old_user_id);
@@ -122,12 +162,6 @@ router.post('/reset-credentials', async (req, res) => {
                 .from('store_members')
                 .delete()
                 .eq('user_id', old_user_id);
-        }
-
-        // Validate email format
-        const emailRegex = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-        if (!emailRegex.test(new_email)) {
-            return res.status(400).json({ error: 'Invalid email format' });
         }
 
         // Create new manager
@@ -160,14 +194,10 @@ router.post('/reset-credentials', async (req, res) => {
                 role: 'manager',
             });
 
-        const CRED_KEY = 'yourpos-secret-key-2026'
-        let xorResult = '';
-        for (let i = 0; i < new_password.length; i++) {
-            xorResult += String.fromCharCode(
-                new_password.charCodeAt(i) ^ CRED_KEY.charCodeAt(i % CRED_KEY.length)
-            );
-        }
-        const encryptedPassword = Buffer.from(xorResult, 'binary').toString('base64');
+        // AES-256-CBC with a server-side key. The old scheme XOR'd against a constant
+        // that shipped inside the mobile bundle, so anyone with the app could recover
+        // every stored password.
+        const encryptedPassword = encrypt(new_password);
 
         await supabaseAdmin
             .from('store_credentials')
@@ -190,6 +220,55 @@ router.post('/reset-credentials', async (req, res) => {
 
     } catch (error) {
         console.error('Reset credentials error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// GET /api/branches/:storeId/credentials
+// Returns the manager login for a store. Owner only — the password is decrypted here
+// because the key lives on the server; the client must never hold it.
+router.get('/:storeId/credentials', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const owner_id = req.user.id;
+
+        const { data: store, error: storeError } = await supabaseAdmin
+            .from('stores')
+            .select('id, owner_id')
+            .eq('id', storeId)
+            .single();
+
+        if (storeError || !store) {
+            return res.status(404).json({ error: 'Store not found' });
+        }
+
+        if (store.owner_id !== owner_id) {
+            return res.status(403).json({ error: 'Not authorized' });
+        }
+
+        const { data: cred } = await supabaseAdmin
+            .from('store_credentials')
+            .select('email, password_encrypted')
+            .eq('store_id', storeId)
+            .order('created_at', { ascending: false })
+            .limit(1);
+
+        const row = cred?.[0];
+        if (!row) {
+            return res.status(404).json({ error: 'No credentials stored for this store' });
+        }
+
+        res.json({
+            success: true,
+            data: {
+                email: row.email,
+                // null when the stored value predates the AES migration (old XOR rows)
+                // or the key changed — the client shows a "reset password" hint instead.
+                password: decrypt(row.password_encrypted)
+            }
+        });
+    } catch (error) {
+        console.error('Get credentials error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -373,11 +452,12 @@ router.delete('/delete', async (req, res) => {
             .eq('store_id', store_id);
 
         // 14. Get all products for this store
+        // Include soft-deleted products: filtering them out here (and in step 20) left
+        // their rows and their batches/transactions orphaned after the store was gone.
         const { data: products } = await supabaseAdmin
             .from('products')
             .select('id')
-            .eq('store_id', store_id)
-            .is('deleted_at', null);
+            .eq('store_id', store_id);
 
         if (products && products.length > 0) {
             const productIds = products.map(p => p.id);
@@ -421,12 +501,11 @@ router.delete('/delete', async (req, res) => {
             .delete()
             .eq('store_id', store_id);
 
-        // 20. Delete products
+        // 20. Delete products (soft-deleted ones included — the store is going away)
         await supabaseAdmin
             .from('products')
             .delete()
-            .eq('store_id', store_id)
-            .is('deleted_at', null);
+            .eq('store_id', store_id);
 
         // 21. Delete product_categories
         await supabaseAdmin
