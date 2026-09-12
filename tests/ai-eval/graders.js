@@ -92,10 +92,29 @@ function gradeRecommendations(items, scenario) {
         .filter((t) => /[×x*]\s*฿?\d|=\s*฿?\d|\(\s*ปกติ|\d\s*×/.test(t));
     add('impact_has_no_formula', mathy.length === 0, mathy.join(' | '));
 
-    const pricingBad = items
-        .filter((s) => s?.type === 'pricing')
-        .filter((s) => s.recommended_discount != null);
-    add('pricing_has_no_discount', pricingBad.length === 0, `${pricingBad.length} pricing items carry a discount`);
+    // A price DECREASE must always carry a real recommended_discount (the server computes it
+    // deterministically from current_price/suggested_price — see routes/ai.js — so the client
+    // has real numbers for the "จัดโปร" auto-revert path instead of nothing). A price INCREASE
+    // (margin fix) must never carry one — there's no per-unit discount to build a promo from.
+    const pricingWrong = items
+        .filter((s) => s?.type === 'pricing' && s.current_price != null && s.suggested_price != null)
+        .filter((s) => {
+            const isDecrease = Number(s.suggested_price) < Number(s.current_price);
+            return isDecrease ? !s.recommended_discount : !!s.recommended_discount;
+        });
+    add('pricing_discount_matches_direction', pricingWrong.length === 0,
+        pricingWrong.map((s) => `${s.title}: ${s.current_price}->${s.suggested_price} discount=${!!s.recommended_discount}`).join(' | '));
+
+    // When a pricing rec does carry a discount, its percent has to be the real percent between
+    // current_price and price_after_discount — not a generic/rounded guess (observed: always 20%).
+    const pricingPercentWrong = items
+        .filter((s) => s?.type === 'pricing' && s.recommended_discount?.percent != null && s.current_price)
+        .filter((s) => {
+            const expected = Math.round((1 - s.recommended_discount.price_after_discount / s.current_price) * 100);
+            return expected !== Number(s.recommended_discount.percent);
+        });
+    add('pricing_discount_percent_is_real', pricingPercentWrong.length === 0,
+        pricingPercentWrong.map((s) => `${s.title}: got ${s.recommended_discount.percent}%`).join(' | '));
 
     const pricingItems = items.filter((s) => s?.type === 'pricing' && s.suggested_price);
     if (pricingItems.length) {

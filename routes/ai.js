@@ -192,7 +192,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     // B. Current Stock
     const { data: products } = await supabaseAdmin
         .from('products')
-        .select('id, name, stock_qty, cost_price, price, low_stock_threshold, unit_type')
+        .select('id, name, stock_qty, cost_price, price, low_stock_threshold, unit_type, image_url')
         .eq('store_id', storeId)
         .is('deleted_at', null);
 
@@ -241,7 +241,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     // ดึงทุก batch ที่ expire ภายใน 30 วันก่อน ถึง 14 วันหน้า แล้วจัดหมวดใน JS
     const { data: allExpiryBatches } = await supabaseAdmin
         .from('product_batches')
-        .select('remaining_qty, expire_date, products!inner(name, store_id, cost_price, price, unit_type)')
+        .select('remaining_qty, expire_date, products!inner(name, store_id, cost_price, price, unit_type, image_url)')
         .eq('products.store_id', storeId)
         .is('products.deleted_at', null)
         .gt('remaining_qty', 0)
@@ -268,6 +268,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
         const unit = b.products?.unit_type || 'ชิ้น';
         const costPrice = parseFloat(b.products?.cost_price) || 0;
         const sellPrice = parseFloat(b.products?.price) || 0;
+        const imageUrl = b.products?.image_url || null;
         const expireDateStr = b.expire_date; // YYYY-MM-DD
 
         // เปรียบเทียบ date string โดยตรง ไม่มี timezone drift
@@ -275,22 +276,22 @@ const getStoreSummary = async (storeId, lat, lon) => {
             // หมดอายุแล้ว (เมื่อวานหรือก่อนหน้า)
             const msAgo = new Date(todayDateStr).getTime() - new Date(expireDateStr).getTime();
             const daysAgo = Math.round(msAgo / (1000 * 60 * 60 * 24));
-            expiredList.push({ name, qty, unit, costPrice, sellPrice, status: `หมดอายุแล้ว ${daysAgo} วัน` });
+            expiredList.push({ name, qty, unit, costPrice, sellPrice, image_url: imageUrl, status: `หมดอายุแล้ว ${daysAgo} วัน` });
         } else if (expireDateStr === todayDateStr) {
             // หมดวันนี้
-            expiresTodayList.push({ name, qty, unit, costPrice, sellPrice, status: 'หมดวันนี้', daysUntilExpiry: 0 });
+            expiresTodayList.push({ name, qty, unit, costPrice, sellPrice, image_url: imageUrl, status: 'หมดวันนี้', daysUntilExpiry: 0 });
         } else {
             // ยังไม่หมด (> วันนี้)
             const msLeft = new Date(expireDateStr).getTime() - new Date(todayDateStr).getTime();
             const daysLeft = Math.round(msLeft / (1000 * 60 * 60 * 24));
-            expiryList.push({ name, qty, unit, costPrice, sellPrice, status: `อีก ${daysLeft} วัน`, daysUntilExpiry: daysLeft });
+            expiryList.push({ name, qty, unit, costPrice, sellPrice, image_url: imageUrl, status: `อีก ${daysLeft} วัน`, daysUntilExpiry: daysLeft });
         }
     });
 
     // C. Debt with Customer Names
     const { data: debts } = await supabaseAdmin
         .from('credit_accounts')
-        .select('remaining_amount, customers_info!inner(store_id, name, phone, due_date)')
+        .select('remaining_amount, customers_info!inner(store_id, name, phone, due_date, image_url)')
         .eq('customers_info.store_id', storeId)
         .gt('remaining_amount', 0)
         .order('remaining_amount', { ascending: false });
@@ -300,6 +301,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
     debts?.forEach(d => {
         const name = d.customers_info?.name || 'ไม่ระบุชื่อ';
         const phone = d.customers_info?.phone || null;
+        const imageUrl = d.customers_info?.image_url || null;
         const amount = parseFloat(d.remaining_amount) || 0;
         const dueDate = d.customers_info?.due_date ? new Date(d.customers_info.due_date) : null;
         const today = new Date();
@@ -316,7 +318,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
             // Keep the most urgent status
             if (!debtMap[name].status && status) debtMap[name].status = status;
         } else {
-            debtMap[name] = { name, phone, amount, status };
+            debtMap[name] = { name, phone, amount, status, image_url: imageUrl };
         }
     });
     const debtList = Object.values(debtMap).sort((a, b) => b.amount - a.amount);
@@ -438,6 +440,7 @@ const getStoreSummary = async (storeId, lat, lon) => {
                 unit: p.unit_type || 'ชิ้น',
                 costPrice: parseFloat(p.cost_price) || 0,
                 sellPrice: parseFloat(p.price) || 0,
+                image_url: p.image_url || null,
                 suggestedOrder: suggestedOrder
             });
         }
@@ -449,7 +452,8 @@ const getStoreSummary = async (storeId, lat, lon) => {
                 qty: parseFloat(p.stock_qty) || 0,
                 unit: p.unit_type || 'ชิ้น',
                 costPrice: parseFloat(p.cost_price) || 0,
-                sellPrice: parseFloat(p.price) || 0
+                sellPrice: parseFloat(p.price) || 0,
+                image_url: p.image_url || null
             });
             // ถ้ากำไรดีมากแต่ขายนิ่ง
             if (marginPercent > 40) highMarginLowVolume.push(`${p.name} (กำไรตั้ง ${marginPercent}%)`);
@@ -695,6 +699,7 @@ ${data.context}
    - กลุ่ม 1 "ใกล้หมดอายุ" (daysLeft > 0) → ยังขายได้ → แนะนำโปรลดราคาตามปกติ
 7. 🚫 **ห้ามแนะนำโปร/จับคู่สินค้าที่อยู่ใน ZERO STOCK** ถึงแม้จะเคยขายดีหรืออยู่ใน Best Pairs ก็ตาม ให้บอกแค่ว่า "หมดสต็อก ต้องสั่งเพิ่มก่อน" และห้ามใส่ [ACTION:...] ประเภท promotion สำหรับสินค้าเหล่านี้
 8. ✅ **รูปแบบ [ACTION:{...}] ที่รองรับ — เลือกให้เหมาะกับสถานการณ์จริง ห้ามใช้ discount_percent ทุกกรณี:**
+   - "percent" ต้องคำนวณจากทุน (cost_price) และราคาขายจริงของสินค้านั้นเสมอ (เช่น ลดราคาให้เหลือกำไรขั้นต่ำที่ยังคุ้ม ~15-20%) ห้ามตอบ 20 ลอยๆ ทุกครั้งโดยไม่คำนวณ — เลข 20 ในตัวอย่างข้างล่างเป็นแค่ตัวอย่างรูปแบบ JSON เท่านั้น ไม่ใช่ค่าเริ่มต้นที่ต้องใช้ตลอด
    - ลดราคา %: [ACTION:{"type":"promotion","promotionType":"discount_percent","percent":20,"products":["ชื่อสินค้า"],"days":3}]
    - ซื้อ N แถม M (ของมีเยอะ/ค้างสต็อก): [ACTION:{"type":"promotion","promotionType":"buy_x_get_y","minQty":2,"freeQty":1,"products":["ชื่อสินค้า"],"days":7}]
    - ซื้อคู่ถูกกว่า (Best Pairs): [ACTION:{"type":"promotion","promotionType":"bundle","products":["สินค้าA","สินค้าB"],"days":7}]
@@ -975,8 +980,9 @@ ${activePromoNames.length > 0 ? `\n🚫 สินค้าที่มีโป�
         * sold30d>15 และ margin<15% → ขึ้นราคา ให้ได้ margin ~20% (ขายดีแต่กำไรบาง)
         * margin 15-20% → ขึ้นได้เล็กน้อย ให้ได้ margin ~22%
     - "price_change_reason": อธิบายสั้นๆ ว่าทำไม พร้อมบอก margin เดิม/ใหม่ เช่น "กำไรบางเกิน (8%) ขึ้นราคาเพื่อให้ได้ margin 20%"
-    - "recommended_discount" ต้องเป็น null เสมอสำหรับ type=pricing
-    - ถ้าขายไม่ออก (sold30d=0) ให้ action_label = "ปรับราคา/จัดโปร" เพื่อให้ผู้ใช้เลือกได้
+    - ไม่ต้องใส่ "recommended_discount" หรือกำหนด action_label เอง — server คำนวณให้อัตโนมัติจาก
+      current_price/suggested_price หลังจากนี้แล้ว (ลดราคา = ใส่ recommended_discount จริงให้ผู้ใช้จัดโปรได้,
+      ขึ้นราคา = null เพราะเป็นการปรับถาวรล้วนๆ)
 
 🧠 ก่อนตอบ ให้คิดเป็นขั้นตอนก่อน แล้วใส่ผลการคิดไว้ในสมาชิกตัวแรกของ array เป็น {"_thinking":"..."} (ระบบจะตัดทิ้งเอง) จากนั้นตามด้วยคำแนะนำ 6 ข้อ รวมเป็น 7 สมาชิก
 ขั้นตอนที่ต้องคิดใน _thinking:
@@ -1182,7 +1188,7 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
             if (s.type === 'pricing' && Array.isArray(s.target_products) && s.target_products.length > 0) {
                 const { data: pricingProducts } = await supabaseAdmin
                     .from('products')
-                    .select('id, name, price, cost_price, stock_qty, unit_type')
+                    .select('id, name, price, cost_price, stock_qty, unit_type, image_url')
                     .eq('store_id', storeId)
                     .is('deleted_at', null)
                     .or(s.target_products.map(n => `name.ilike.%${n}%`).join(','));
@@ -1286,6 +1292,37 @@ Output JSON array เท่านั้น ไม่ต้องมีอะไ�
                     } else if (diffPerUnit < 0) {
                         expected_impact = `ลดราคา ฿${currentPrice}→฿${suggestedPrice}${marginStr} เพื่อระบาย ${stockQty} ${unit} ออก`;
                     }
+                }
+
+                // A price DECREASE on a type=pricing rec is always a clearance signal in practice
+                // (every real "ลดราคา" reason says ขายไม่ออก/ระบายสต็อก, never a margin reason) —
+                // give it a real recommended_discount computed here, the same way as type=stock,
+                // instead of trusting the model to also emit one (it was told to always leave this
+                // null, so the client had nothing to build a promo from and faked a generic 20%).
+                // A price INCREASE (margin fix) stays a pure permanent reprice: no discount, no
+                // "จัดโปร" alternative — there's nothing to build a promo from that has a per-unit
+                // discount price.
+                if (suggestedPrice && currentPrice && suggestedPrice < currentPrice) {
+                    const percent = Math.round((1 - suggestedPrice / currentPrice) * 100);
+                    if (percent > 0) {
+                        payload.recommended_discount = {
+                            promotion_type: 'discount_percent',
+                            percent,
+                            price_after_discount: suggestedPrice,
+                            days_valid: 7,
+                            ...(cost > 0 ? { profit_per_unit: Math.round(suggestedPrice - cost) } : {}),
+                            ...(stockQty > 0 ? {
+                                total_recovery: Math.round(suggestedPrice * stockQty),
+                                vs_total_loss: Math.round(currentPrice * stockQty),
+                            } : {}),
+                            reason: payload.price_change_reason || s.detail || '',
+                        };
+                        s.action_label = 'ปรับราคา/จัดโปร';
+                    } else {
+                        payload.recommended_discount = null;
+                    }
+                } else {
+                    payload.recommended_discount = null;
                 }
             }
 
@@ -1714,7 +1751,7 @@ router.get('/active-promotions', async (req, res) => {
             id, name, type, discount_value, 
             min_qty_required, free_qty, min_spend,
             start_date, end_date, is_active, created_at,
-            promotion_items(product_id, products(name))
+            promotion_items(product_id, products(name, image_url))
         `)
         .eq('store_id', storeId)
         .eq('is_active', true)

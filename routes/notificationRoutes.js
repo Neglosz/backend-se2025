@@ -28,7 +28,45 @@ const registerNotificationRoutes = ({
             }
             const { data, error } = await query.order('created_at', { ascending: false });
             if (error) throw error;
-            res.json({ success: true, data });
+
+            // Attach the real product/customer photo when the notification's payload
+            // points at one, so the app can show it instead of a generic icon. Batched
+            // into at most 2 extra queries (not per-row) — id sets, not a loop.
+            const productIds = new Set();
+            const customerIds = new Set();
+            for (const n of data || []) {
+                const p = n.payload || {};
+                const pid = p.product_id || p.productId;
+                if (pid) productIds.add(pid);
+                if (p.customer_id) customerIds.add(p.customer_id);
+            }
+
+            const productImageMap = {};
+            if (productIds.size > 0) {
+                const { data: prods } = await supabaseAdmin
+                    .from('products')
+                    .select('id, image_url')
+                    .in('id', [...productIds]);
+                (prods || []).forEach(p => { if (p.image_url) productImageMap[p.id] = p.image_url; });
+            }
+
+            const customerImageMap = {};
+            if (customerIds.size > 0) {
+                const { data: custs } = await supabaseAdmin
+                    .from('customers_info')
+                    .select('id, image_url')
+                    .in('id', [...customerIds]);
+                (custs || []).forEach(c => { if (c.image_url) customerImageMap[c.id] = c.image_url; });
+            }
+
+            const enriched = (data || []).map(n => {
+                const p = n.payload || {};
+                const pid = p.product_id || p.productId;
+                const imageUrl = (pid && productImageMap[pid]) || (p.customer_id && customerImageMap[p.customer_id]) || null;
+                return imageUrl ? { ...n, payload: { ...p, image_url: imageUrl } } : n;
+            });
+
+            res.json({ success: true, data: enriched });
         } catch (error) {
             res.status(500).json({ success: false, error: error.message });
         }
@@ -185,7 +223,7 @@ const registerNotificationRoutes = ({
     // ==================== AUTOMATED NOTIFICATION SCHEDULER ====================
 
     // Reusable function to process notifications for a SPECIFIC store
-    const processStoreNotifications = async (storeId) => {
+    const processStoreNotificationsInner = async (storeId) => {
         const TH_OFFSET_MS = 7 * 60 * 60 * 1000;
         const today = new Date(Date.now() + TH_OFFSET_MS);
         const todayStr = today.toISOString().split('T')[0];
@@ -491,6 +529,30 @@ const registerNotificationRoutes = ({
         } catch (error) {
             console.error(`Error processing store ${storeId}:`, error);
             return results;
+        }
+    };
+
+    // Real duplicate notifications were found in production (same customer, same
+    // reference, two rows created ~1-2ms apart): processStoreNotificationsInner does
+    // a SELECT to check for an existing row, then a separate INSERT/UPDATE — a classic
+    // check-then-act race. This happens when two triggers overlap for the same store,
+    // e.g. the scheduler's immediate run-on-boot landing at the same moment as someone
+    // tapping the manual refresh button. A per-store in-process lock closes that window.
+    // NOTE: this only protects a single Node process — if this API is ever run as
+    // multiple replicas behind a load balancer, the real fix is a DB-level unique
+    // constraint on (user_id, reference_id, reference_type) with an upsert against it;
+    // that needs a migration (and the DB password) this session doesn't have.
+    const storesCurrentlyProcessing = new Set();
+    const processStoreNotifications = async (storeId) => {
+        if (storesCurrentlyProcessing.has(storeId)) {
+            console.log(`[Notifications] Skipping overlapping check for store ${storeId} — one is already running`);
+            return { expired: 0, nearExpiry: 0, paymentOverdue: 0, paymentDueSoon: 0, promoEnding: 0, cleaned: 0, skipped: true };
+        }
+        storesCurrentlyProcessing.add(storeId);
+        try {
+            return await processStoreNotificationsInner(storeId);
+        } finally {
+            storesCurrentlyProcessing.delete(storeId);
         }
     };
 
